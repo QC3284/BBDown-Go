@@ -105,6 +105,69 @@ type subCheckSchedule struct {
 	Since time.Duration
 	// Concurrency 是检查阶段的并发订阅数（下载阶段恒为串行）。
 	Concurrency int
+	// DelayPerItem 是每个工作单元之间的停顿（t71，--delay-per-item）；0 = 不节流。
+	// 工作单元 = 开始检查一个订阅 / 下载一个新增内容；列表翻页不算（请求量小两个数量级）。
+	DelayPerItem time.Duration
+}
+
+// subCheckMaxDelayPerItem 是 --delay-per-item 的上限（秒）：再长就该用 cron 而不是干等。
+const subCheckMaxDelayPerItem = 600
+
+// parseDelayPerItem 校验 --delay-per-item（秒）：0~600，越界时错误里同时给出选项名与范围。
+func parseDelayPerItem(seconds int) (time.Duration, error) {
+	if seconds < 0 || seconds > subCheckMaxDelayPerItem {
+		return 0, fmt.Errorf("--delay-per-item %d 无效：取值范围 0-%d 秒（默认 0 = 不节流）",
+			seconds, subCheckMaxDelayPerItem)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+// subCheckSleep 是停顿的实现：用例替换成假等待（不真睡，只记录事件与时长）。
+//
+// 必须感知 ctx：停顿期间被取消要**原样上抛** context.Canceled（不能把取消吞掉再继续下载）。
+var subCheckSleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// subCheckDelayFromFlags 把 CLI 的 --delay-per-item 读成 duration。
+//
+// 为什么在这里读包级 flag 变量：flag→schedule 的桥接点本该在 runSubCheck（commands.go），
+// 而那个文件不在本任务的 inScope 里。等那条 scope 打开后，把这一行挪回 commands.go 即可，
+// 判定/节流逻辑本身不动。
+func subCheckDelayFromFlags() time.Duration {
+	d, err := parseDelayPerItem(optSubCheckDelayPerItem)
+	if err != nil {
+		return 0 // 非法值由 PreRunE 先拦住；这里只做兜底
+	}
+	return d
+}
+
+// subCheckPacer 实现 --delay-per-item：**首个工作单元不等待**，之后每个单元前停顿 delay。
+//
+// 为什么首个不等：节流是为了把连发摊开，不是给第一个动作额外加延迟——cron 场景下第一个
+// 单元本来就在用户预期的时刻开始（上游 1.7.7 同语义）。
+type subCheckPacer struct {
+	delay  time.Duration
+	waited bool
+}
+
+// wait 在该工作单元开始前调用；返回的错误原样上抛（取消语义由此保住）。
+func (p *subCheckPacer) wait(ctx context.Context) error {
+	if p.delay <= 0 {
+		return nil
+	}
+	if !p.waited {
+		p.waited = true
+		return nil
+	}
+	return subCheckSleep(ctx, p.delay)
 }
 
 // parseSubCheckSchedule 校验 --since / --concurrency（纯函数，离线可测）。
@@ -438,7 +501,7 @@ func subCheckChecks(ctx context.Context, subs []substore.Subscription, deps subC
 //
 // 注意下载失败**不**中止：与改前一致，继续下一个 aid、最后用退出码汇总。
 // RecordDownloaded 只在下载成功之后调用——中断时状态文件因此不会记进没下完的 aid。
-func subCheckReportOne(ctx context.Context, deps subCheckDeps, oc subCheckOutcome, sched subCheckSchedule, failures *int) error {
+func subCheckReportOne(ctx context.Context, deps subCheckDeps, oc subCheckOutcome, sched subCheckSchedule, failures *int, pacer *subCheckPacer) error {
 	switch oc.kind {
 	case subCheckCancelled, subCheckResolvedEmpty:
 		return nil
@@ -473,6 +536,10 @@ func subCheckReportOne(ctx context.Context, deps subCheckDeps, oc subCheckOutcom
 	}
 	util.Log("  发现 %d 个新内容: %s", len(oc.newAids), joinAids(oc.newAids))
 	for _, aid := range oc.newAids {
+		// t71：每个「下载一个新增内容」也是一个工作单元，前面同样停顿（首个单元除外）。
+		if err := pacer.wait(ctx); err != nil {
+			return err
+		}
 		if err := deps.downloadOne(ctx, oc.sub, aid); err != nil {
 			util.LogWarn("av%s 下载失败: %v", aid, err)
 			*failures = *failures + 1
@@ -492,6 +559,13 @@ func subCheckReportOne(ctx context.Context, deps subCheckDeps, oc subCheckOutcom
 // 为 context.Canceled 表示在订阅边界上被取消（与改前 return silenceOnCancel(cmd, ctx.Err())
 // 同一语义），其它值表示整体中止。
 func subCheckRun(ctx context.Context, subs []substore.Subscription, deps subCheckDeps, sched subCheckSchedule, now time.Time) (failures int, err error) {
+	// --delay-per-item 的桥接（见 subCheckDelayFromFlags 的注释）：显式 0 与未设置等价，
+	// 都是「不节流」，所以这里统一兜底。
+	if sched.DelayPerItem <= 0 {
+		sched.DelayPerItem = subCheckDelayFromFlags()
+	}
+	pacer := &subCheckPacer{delay: sched.DelayPerItem}
+
 	if sched.Concurrency <= 1 {
 		// 串行路径（默认）：检查与下载逐订阅交错，日志顺序与改前逐字一致。
 		// 这里的顺序是承重的：fetcher 与下载层自己也会打日志（「共 N 个投稿, 正在获取分P信息...」、
@@ -501,9 +575,14 @@ func subCheckRun(ctx context.Context, subs []substore.Subscription, deps subChec
 			if ctx.Err() != nil {
 				return failures, context.Canceled
 			}
+			// t71：串行路径下「开始检查一个订阅」也是工作单元——无新增内容时相邻订阅之间
+			// 同样要停顿（首检大 UP 之后的那几次检查同样在风控窗口里）。
+			if err := pacer.wait(ctx); err != nil {
+				return failures, err
+			}
 			util.Log("检查订阅: %s (%s)", sub.Name, sub.Target)
 			oc := subCheckOne(ctx, deps, sub, sched, now)
-			if err := subCheckReportOne(ctx, deps, oc, sched, &failures); err != nil {
+			if err := subCheckReportOne(ctx, deps, oc, sched, &failures, pacer); err != nil {
 				return failures, err
 			}
 		}
@@ -522,7 +601,9 @@ func subCheckRun(ctx context.Context, subs []substore.Subscription, deps subChec
 			continue
 		}
 		util.Log("检查订阅: %s (%s)", oc.sub.Name, oc.sub.Target)
-		if err := subCheckReportOne(ctx, deps, oc, sched, &failures); err != nil {
+		// 并发路径只节流**下载**：检查阶段本来就是并行跑的，把它们的启动串行排队会直接
+		// 抵消 --concurrency（见 subCheckChecks 的注释）。
+		if err := subCheckReportOne(ctx, deps, oc, sched, &failures, pacer); err != nil {
 			return failures, err
 		}
 	}

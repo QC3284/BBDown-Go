@@ -22,6 +22,22 @@ import (
 // error. The JSON root "message" is authoritative; a raw substring check only
 // backs up non-JSON bodies, so a wording or encoding change cannot silently
 // disable the web-page fallback (upstream IsVipRestrictedResponse).
+// ParseModeName 返回当前解析模式的展示名（t69，吸收上游 1.7.5）：
+// TV / APP / INTL / WEB。登录横幅要据此说明「实际用的是哪个模式」——TV/APP/INTL 凭
+// access_token 鉴权，与 web cookie 无关，不能因为 web 未登录就报「未登录只能试看」。
+func ParseModeName(tvAPI, appAPI, intlAPI bool) string {
+	switch {
+	case intlAPI:
+		return "INTL"
+	case appAPI:
+		return "APP"
+	case tvAPI:
+		return "TV"
+	default:
+		return "WEB"
+	}
+}
+
 func isVipRestricted(jsonStr string) bool {
 	var doc map[string]interface{}
 	if util.UnmarshalJSON(jsonStr, &doc) == nil {
@@ -295,7 +311,7 @@ func (p *Parser) ExtractTracks(ctx context.Context, aidOri, aid, cid, epid strin
 
 	result := &entity.ParsedResult{}
 
-	jsonStr, err := p.fetchPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, intlAPI, &appAPI, wantDrm, qn)
+	jsonStr, err := p.fetchPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, intlAPI, &appAPI, wantDrm, qn, requestAudioLanguage)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +332,60 @@ func (p *Parser) ExtractTracks(ctx context.Context, aidOri, aid, cid, epid strin
 // 直接失败（错误还被批量输入那层吞掉了，见 §4.42）。BBDownT 也只改 APP 的 MaximumQuality。
 const maxQn = "127"
 
+// requestAudioLanguage 是 --audio-language 的**请求值**（t95）：空串 = 与改前逐字一致的请求形态
+// （不带 cur_language 参数）。非空时 playurl 请求带 cur_language=<code>，并核对响应里的 cur_language 是否真的切过去了。
+//
+// 为什么用包级变量而不是给 Parse 加参数：Parse 的签名被 parser/fetcher/workflow 三处调用，加参数会波及 t95 inScope
+// 之外的包。编排层接线只需一行 parser.SetRequestAudioLanguage(code)（t79 的收尾任务负责把 --audio-language 传进来，
+// 并删掉 workflow 侧那条「解析层尚未接入」的失败门）。
+var requestAudioLanguage string
+
+// SetRequestAudioLanguage 写入本次解析要切换的配音语言代码（空串 = 不切换、请求形态不变）。
+func SetRequestAudioLanguage(code string) {
+	requestAudioLanguage = strings.TrimSpace(code)
+}
+
+// RequestAudioLanguage 返回当前请求的配音语言（用例/调试用）。
+func RequestAudioLanguage() string { return requestAudioLanguage }
+
+// confirmPlayURLanguage 核对响应里的实际配音语言（t95 ②）：请求带了 cur_language 时，响应若声明了
+// cur_language 就必须与请求一致——不一致说明服务端没切过去，继续下载会把**默认音轨**挂上所选语言的
+// 后缀（t79 最担心的事）。响应没有 cur_language（绝大多数稿件没有语言段）时视为无可核对。
+func confirmPlayURLanguage(jsonStr, want string) error {
+	if want == "" {
+		return nil
+	}
+	cur, ok := playURLanguage(jsonStr)
+	if !ok || cur == "" {
+		return nil
+	}
+	if !strings.EqualFold(cur, want) {
+		return fmt.Errorf("播放文档返回的配音语言是 %q，与请求的 %q 不一致：服务端没有切换到该语言，继续下载会把默认音轨存成所选语言（可用 -I 查看该稿件真实可用的配音语言）", cur, want)
+	}
+	return nil
+}
+
+// playURLanguage 从播放文档里读 cur_language（顶层或 result/data 下，兼容几种根形态）。
+func playURLanguage(jsonStr string) (string, bool) {
+	var doc map[string]interface{}
+	if util.UnmarshalJSON(jsonStr, &doc) != nil {
+		return "", false
+	}
+	roots := []map[string]interface{}{doc}
+	if res, ok := doc["result"].(map[string]interface{}); ok {
+		roots = append(roots, res)
+	}
+	if data, ok := doc["data"].(map[string]interface{}); ok {
+		roots = append(roots, data)
+	}
+	for _, r := range roots {
+		if v, ok := r["cur_language"].(string); ok && v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // fetchPlayJSON 取播放文档：非 INTL/APP 时优先请求最高清晰度（qn=127），只在它失败或
 // 不带 dash.video 时回落调用方给的 qn（默认 "0"）。
 //
@@ -326,13 +396,23 @@ const maxQn = "127"
 //
 // 取消必须原样向上传播（上游 RF-17）：两遍都失败时报回落那次的错误——旧流程在同样情形下
 // 报的正是 qn=0 这次的错误。
-func (p *Parser) fetchPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, epid string, tvAPI, intlAPI bool, appAPI *bool, wantDrm bool, qn string) (string, error) {
+func (p *Parser) fetchPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, epid string, tvAPI, intlAPI bool, appAPI *bool, wantDrm bool, qn, curLanguage string) (string, error) {
 	if intlAPI || *appAPI {
-		return p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, intlAPI, appAPI, wantDrm, qn)
+		doc, err := p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, intlAPI, appAPI, wantDrm, qn, curLanguage)
+		if err != nil {
+			return "", err
+		}
+		if err := confirmPlayURLanguage(doc, curLanguage); err != nil {
+			return "", err
+		}
+		return doc, nil
 	}
 
-	first, err := p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, false, appAPI, wantDrm, maxQn)
+	first, err := p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, false, appAPI, wantDrm, maxQn, curLanguage)
 	if err == nil && hasDashVideo(first) {
+		if cerr := confirmPlayURLanguage(first, curLanguage); cerr != nil {
+			return "", cerr
+		}
 		return first, nil
 	}
 	if ctx.Err() != nil {
@@ -344,12 +424,15 @@ func (p *Parser) fetchPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, 
 		util.LogDebug("最高清晰度请求未返回 DASH 轨道，回落 qn=%s", qn)
 	}
 
-	fallback, ferr := p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, false, appAPI, wantDrm, qn)
+	fallback, ferr := p.getPlayJSON(ctx, encoding, aidOri, aid, cid, epid, tvAPI, false, appAPI, wantDrm, qn, curLanguage)
 	if ferr != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", ferr
+	}
+	if cerr := confirmPlayURLanguage(fallback, curLanguage); cerr != nil {
+		return "", cerr
 	}
 	return fallback, nil
 }
@@ -384,7 +467,7 @@ func hasDashVideo(jsonStr string) bool {
 	return false
 }
 
-func (p *Parser) getPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, epid string, tvAPI, intlAPI bool, appAPI *bool, wantDrm bool, qn string) (string, error) {
+func (p *Parser) getPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, epid string, tvAPI, intlAPI bool, appAPI *bool, wantDrm bool, qn, curLanguage string) (string, error) {
 	if intlAPI {
 		return p.getIntlPlayJSON(ctx, aid, cid, epid, qn, "0")
 	}
@@ -454,6 +537,10 @@ func (p *Parser) getPlayJSON(ctx context.Context, encoding, aidOri, aid, cid, ep
 		}
 		if wantDrm {
 			parts = append(parts, "drm_tech_type=2")
+		}
+		// t95：显式指定配音语言时带上 cur_language（空串不拼，请求形态与改前逐字一致）。
+		if curLanguage != "" {
+			parts = append(parts, "cur_language="+curLanguage)
 		}
 		parts = append(parts, "wts="+timeStamp())
 		params := strings.Join(parts, "&")

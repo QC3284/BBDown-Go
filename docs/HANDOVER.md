@@ -1,15 +1,13 @@
 # 交接文件（HANDOVER）
 
 > 面向接手的下一位（人或代理）。**先读 `AGENTS.md`**（项目规矩），再看本文件（现状 + 坑 + 待办）。
-> 最后更新：版本 `2.16.0`（上游同步批次：AI 字幕解码 / DRM 开箱 / 订阅三件 / v_voucher / mp4decrypt / argv），提交见 tag `v2.16.0`，
-> 工作区干净，`go test ./... -count=1` 17 包全绿，六条实现线审查门 verdict=pass。
+> 最后更新：版本 `3.1.0`（上游同步大批次：五件同病修复 + BBDownT 六功能件），提交见 tag `v3.1.0`，
 
 ---
 
 ## 1. 一句话现状
 
-`/home/qc233/github-code/BBDown`（分支 `main`）是 **BBDown 生态的 Go 主线实现**：起步自 C# 版 `AliverAnme/BBDown` v1.6.20 的重写，
-此后独立演进。当前版本 **`2.16.0`**，已发布 tag / GitHub Release（5 产物，含内置 device.wvd+mp4decrypt）/ AUR 包 `BBDown-Go-git`（VCS 包，随 tag 自动更新）。
+此后独立演进。当前版本 **`3.1.0`**，已发布 tag / GitHub Release（5 产物，含内置 device.wvd+mp4decrypt）/ AUR 包 `bbdown-go-git`（VCS 包，随 tag 自动更新）。
 
 规格来源有四个，冲突时**以实测为准**：上游 C#（本地 git 对象库即可查）、`LOVAHE/BBDownT`（C# 2.x，风控情报价值最高）、
 `bilibili-API-collect`、探针实测。

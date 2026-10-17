@@ -147,6 +147,12 @@
 
 - 完成：/add-task 15 字段白名单（t13/t14）、serve Web UI 重设计（t8/t10）、页面 415 修复、202 用例异步 join 竞态修复（疑为 15/16 真根因之一）。
 
+### 3.1.0 批次（2026-10-17）闭环（上游同步大批次）
+
+- 完成：同病修复五件（aria2c 完整性 / token 横幅分流 / grpc-status / live 完整性 / 下载硬化两件 / 工具路径告警）+ BBDownT 功能件六件（--delay-per-item / 字幕双开关 / --audio-language+换轨 / --delay-per-video+--download-all / self-update）；登记 §4.73。
+- 候选（按优先级）：① APP/INTL 的 cur_language 重请求；② 多线程续传 + 分片布局校验（独立功能批次，2~3 人日）；③ util.PostResponseWithHeaders 收敛（postGRPC 的 412 文案/64MiB 上限）；④ tokenAuthMode 与 ParseModeName 单一定义；⑤ live 合并产物重复帧上限；⑥ --audio-format 开关（溏心音乐）；⑦ Web 背景三套；⑧ 五期下载并行实现。
+
+
 ### 2.16.0 批次（2026-10-06）闭环（上游同步批次）
 
 - 完成：AI 字幕起死回生（XOR 解码 + 匿名门控移除）、DRM 开箱即用（内置 wvd/mp4decrypt + 自动解密默认开 + 前置检查）、订阅三件（--per-sub-dir/增量扫描/--full-scan）、mp4decrypt --key 修复、v_voucher 识别、argv 值位置 bug。

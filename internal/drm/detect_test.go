@@ -166,3 +166,38 @@ func TestDescribeAssets(t *testing.T) {
 		t.Errorf("缺失时的文案应当点名缺失：%q", missing)
 	}
 }
+
+// ---- t90（t82 评估 ⑤）：前置检查要点名「你显式给的那个路径」 ----
+
+// TestPrerequisiteHintsNameExplicitMissingPaths 钉住 DRM 侧的两个选项：显式路径不存在时，
+// 错误里必须点名是哪个路径不对（只说「缺 mp4decrypt」用户会以为自己已经指定了）。
+func TestPrerequisiteHintsNameExplicitMissingPaths(t *testing.T) {
+	assets := ResolveAssets("", "/no/such/mp4decrypt", "/no/such/device.wvd")
+	err := CheckDecryptPrerequisites(assets, "", "")
+	if err == nil {
+		t.Fatal("缺 mp4decrypt 与 device.wvd 时必须失败")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"你显式指定的路径 \"/no/such/mp4decrypt\" 不存在",
+		"--mp4decrypt-path",
+		"你显式指定的路径 \"/no/such/device.wvd\" 不存在",
+		"--wvd-path",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误文案缺少 %q：%v", want, msg)
+		}
+	}
+}
+
+// TestPrerequisiteNoExplicitHintWhenUnset：没给显式路径时不该出现这条 hint（保持原文案不变）。
+func TestPrerequisiteNoExplicitHintWhenUnset(t *testing.T) {
+	assets := ResolveAssets("", "", "")
+	err := CheckDecryptPrerequisites(assets, "", "")
+	if err == nil {
+		t.Skip("本机 mp4decrypt/device.wvd 齐全，无法构造缺失场景")
+	}
+	if strings.Contains(err.Error(), "你显式指定的路径") {
+		t.Errorf("没给显式路径时不该出现该 hint：%v", err)
+	}
+}

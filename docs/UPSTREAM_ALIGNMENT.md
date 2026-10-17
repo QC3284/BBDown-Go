@@ -1100,6 +1100,28 @@ SubtitleItem{lan=3,lanDoc=4,subtitleUrl=5}）。只手解三个字段（手写 v
 - **本仓额外收口（覆盖面比上游广）**：`?p=01`（URL 分P参数）与 `VInfo.Index` 两个原样字符串来源一并改为数值匹配（上游只修了 -p 一路）；非数字项退回字符串相等，行为不变。
 - **已免疫项**：int.MaxValue 计数回绕（本仓 maxExpandedPages 段长/累计两处检查都在展开循环之前，无回绕窗口）；展示截前 20 项+总数（maxShownPages=20，与上游 MaxReportedPages 同）。
 
+### 4.73 第六十八轮：上游同步大批次（1.7.4~1.7.7 + BBDownT 2.1.7 功能件）——吸收与有意偏离
+
+**吸收（来源逐条可查）**：
+1. aria2c 预分配中断文件误判完整 → 「大小相等 + <文件>.aria2 存在」判未完成、成功后清理（上游 1.7.4 / 5e57baf 语义一致）；
+2. TV/APP/INTL token 用户误报「未登录仅能试看 6 分钟」→ 按「模式 + 已加载 token」分流（上游 1.7.5）；
+3. gRPC 同时检查 grpc-status（trailer 优先、header 兜底）——HTTP 200 权限拒绝不再误报 protobuf 损坏（上游 1.7.4）；
+4. sub check --delay-per-item 节流（上游 1.7.7，事件流/边界/取消语义逐条对齐）；
+5. live 完整性：截断长度前缀包拒绝 + 零媒体帧段跳过（全零才失败）+ 帧数守恒产物核对（上游 38799fc / 1.7.4 / 1.7.5）；
+6. 分片失败取消兄弟分片 + 完整跳过回收残留（上游 1.7.4/1.7.5，t82 评估 P1）；
+7. 显式工具路径不存在告警（上游 1.7.5，P2）；DRM 侧补「你给的路径不存在」hint；
+8. BBDownT 功能件：--subtitle-language / --ai-subtitle-policy（含 EffectiveSkipAi 接线）、--audio-language（清单+选择+命名+cur_language 重请求）、--delay-per-video / --download-all（--save-archives 既有实现未重复）、self-update（digest fail-closed、只换主二进制、Windows 回滚）。
+
+**有意偏离/取舍（对账勿误判为落后）**：
+- --delay-per-item 并发路径（--concurrency≥2）仅节流下载、不节流检查启动（避免抵消并发；上游 1.7.7 只覆盖串行事件流）；
+- live 合并 Legacy 分支：整场非 FLV（HLS/TS/既有合成负载）沿用旧大小路径，仅「部分 FLV+坏段」整场失败（兼容多源）；
+- grpc-status 非数字不认、落回原解析路径（上游只要存在就抛——本仓更合理）；
+- --audio-language：APP(gRPC)/INTL 未接 cur_language 重请求（响应侧 confirm 仍核对、不一致即报错不静默下错；双模式支持记候选）；
+- self-update 用 GitHub 资产 digest 而非独立 checksums 文件（缺摘要即拒更新）。
+
+**已免疫（登记备查）**：TV playurl 的字符串 result（Go 类型断言天然放行，上游 1.7.6 同病我们未病）；替换 host 404 回退（§4.33 早于上游）；多线程续传布局校验（本仓无多线程续传，不同病——若将来补续传必须同时做布局校验）；服务器透传文本净化（logger/file 层已有 Sanitize）；DRM 唯一临时文件（t45 已是 .dec+rename 语义）。
+
+
 
 
 

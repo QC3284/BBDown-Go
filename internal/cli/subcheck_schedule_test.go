@@ -748,3 +748,212 @@ func TestSubCheckSharedClientIsConcurrencySafe(t *testing.T) {
 		t.Errorf("并发共享 client/factory 出错: %v", err)
 	}
 }
+
+// ---- t71：--delay-per-item 节流（吸收上游 1.7.7）----
+//
+// 判据全部在**事件流**上：注入假等待（subCheckSleep）、假 fetcher、假下载，按真实顺序断言
+// 「list → delay → download → delay → …」。这样不靠墙钟，也就不受慢速 CI runner 影响。
+
+// withFakeSleep 把停顿换成记录事件（不真睡），返回事件切片指针；用例结束还原。
+func withFakeSleep(t *testing.T) *[]string {
+	t.Helper()
+	var events []string
+	orig := subCheckSleep
+	subCheckSleep = func(ctx context.Context, d time.Duration) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		events = append(events, "wait:"+d.String())
+		return nil
+	}
+	t.Cleanup(func() { subCheckSleep = orig })
+	return &events
+}
+
+// eventDeps 造一组会往 events 里记事件的假依赖：fetch=列举（list:<target>），download=下载。
+func eventDeps(t *testing.T, events *[]string, aids map[string][]string) subCheckDeps {
+	t.Helper()
+	return subCheckDeps{
+		resolve: func(_ context.Context, target string) (string, error) { return target, nil },
+		fetch: func(_ context.Context, resolved string) (*entity.VInfo, error) {
+			*events = append(*events, "list:"+resolved)
+			var pages []entity.Page
+			for _, aid := range aids[resolved] {
+				pages = append(pages, entity.Page{Aid: aid, PubTime: time.Now().Unix()})
+			}
+			return &entity.VInfo{Title: resolved, PagesInfo: pages}, nil
+		},
+		download: func(_ context.Context, aid string) error {
+			*events = append(*events, "download:"+aid)
+			return nil
+		},
+	}
+}
+
+// TestParseDelayPerItem 钉住取值范围与错误文案：0~600 合法；越界必须点名选项名与范围。
+func TestParseDelayPerItem(t *testing.T) {
+	for _, ok := range []int{0, 1, 60, 600} {
+		d, err := parseDelayPerItem(ok)
+		if err != nil {
+			t.Errorf("parseDelayPerItem(%d) 不该报错: %v", ok, err)
+			continue
+		}
+		if d != time.Duration(ok)*time.Second {
+			t.Errorf("parseDelayPerItem(%d) = %v, want %v", ok, d, time.Duration(ok)*time.Second)
+		}
+	}
+	for _, bad := range []int{-1, 601, -100} {
+		_, err := parseDelayPerItem(bad)
+		if err == nil {
+			t.Errorf("parseDelayPerItem(%d) 应当报错", bad)
+			continue
+		}
+		for _, want := range []string{"--delay-per-item", "0-600"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("错误文案缺少 %q：%v", want, err)
+			}
+		}
+	}
+}
+
+// TestSubCheckDelayEventFlow 是核心用例：两个订阅各一个新增内容，--delay-per-item 2s →
+// 事件流必须是 list → delay → download → delay → list → delay → download，
+// 即「首个单元不等待、之后每个单元前都停顿」。
+//
+// 变异验证：撤掉 subCheckRun 里对 pacer.wait 的调用 → 本用例红（事件流里没有 wait）。
+func TestSubCheckDelayEventFlow(t *testing.T) {
+	setSubStoreRoot(t, t.TempDir())
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 0
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	events := withFakeSleep(t)
+	subs := []substore.Subscription{
+		{Target: "mid:1", Name: "a"},
+		{Target: "mid:2", Name: "b"},
+	}
+	deps := eventDeps(t, events, map[string][]string{"mid:1": {"101"}, "mid:2": {"102"}})
+	sched := subCheckSchedule{Concurrency: 1, DelayPerItem: 2 * time.Second}
+	if _, err := subCheckRun(context.Background(), subs, deps, sched, time.Now()); err != nil {
+		t.Fatalf("subCheckRun: %v", err)
+	}
+	want := []string{
+		"list:mid:1",
+		"wait:2s", "download:101",
+		"wait:2s", "list:mid:2",
+		"wait:2s", "download:102",
+	}
+	if strings.Join(*events, ",") != strings.Join(want, ",") {
+		t.Errorf("事件流 = %v\n               want %v", *events, want)
+	}
+	if n := len(*events); n != len(want) {
+		t.Errorf("事件数 = %d, want %d", n, len(want))
+	}
+}
+
+// TestSubCheckDelayKeepsGapWithoutNewContent 钉住「无新增内容时相邻订阅之间仍停顿」：
+// 两个订阅都已下载过 → 工作单元只有两次「开始检查」，中间仍要有一个停顿。
+func TestSubCheckDelayKeepsGapWithoutNewContent(t *testing.T) {
+	root := t.TempDir()
+	setSubStoreRoot(t, root)
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 0
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	// 先把两个 aid 记进历史，制造「没有新增内容」。
+	for _, target := range []string{"mid:1", "mid:2"} {
+		if err := substore.RecordDownloaded(target, "101"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := withFakeSleep(t)
+	subs := []substore.Subscription{{Target: "mid:1", Name: "a"}, {Target: "mid:2", Name: "b"}}
+	deps := eventDeps(t, events, map[string][]string{"mid:1": {"101"}, "mid:2": {"101"}})
+	if _, err := subCheckRun(context.Background(), subs, deps,
+		subCheckSchedule{Concurrency: 1, DelayPerItem: time.Second}, time.Now()); err != nil {
+		t.Fatalf("subCheckRun: %v", err)
+	}
+	want := []string{"list:mid:1", "wait:1s", "list:mid:2"}
+	if strings.Join(*events, ",") != strings.Join(want, ",") {
+		t.Errorf("事件流 = %v, want %v", *events, want)
+	}
+}
+
+// TestSubCheckNoDelayByDefault 钉住「默认 0 = 与现状逐字一致」：没有任何停顿事件，
+// 事件顺序也只由 list/download 组成。
+func TestSubCheckNoDelayByDefault(t *testing.T) {
+	setSubStoreRoot(t, t.TempDir())
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 0
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	events := withFakeSleep(t)
+	subs := []substore.Subscription{{Target: "mid:1", Name: "a"}, {Target: "mid:2", Name: "b"}}
+	deps := eventDeps(t, events, map[string][]string{"mid:1": {"101"}, "mid:2": {"102"}})
+	if _, err := subCheckRun(context.Background(), subs, deps, subCheckSchedule{Concurrency: 1}, time.Now()); err != nil {
+		t.Fatalf("subCheckRun: %v", err)
+	}
+	for _, e := range *events {
+		if strings.HasPrefix(e, "wait:") {
+			t.Errorf("默认（0）不该有任何停顿：%v", *events)
+		}
+	}
+	want := []string{"list:mid:1", "download:101", "list:mid:2", "download:102"}
+	if strings.Join(*events, ",") != strings.Join(want, ",") {
+		t.Errorf("事件流 = %v, want %v", *events, want)
+	}
+}
+
+// TestSubCheckDelayFromFlag 钉住 flag→schedule 的桥接：只设 --delay-per-item=3 也能生效。
+func TestSubCheckDelayFromFlag(t *testing.T) {
+	setSubStoreRoot(t, t.TempDir())
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 3
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	events := withFakeSleep(t)
+	subs := []substore.Subscription{{Target: "mid:1", Name: "a"}}
+	deps := eventDeps(t, events, map[string][]string{"mid:1": {"101", "102"}})
+	if _, err := subCheckRun(context.Background(), subs, deps, subCheckSchedule{Concurrency: 1}, time.Now()); err != nil {
+		t.Fatalf("subCheckRun: %v", err)
+	}
+	want := []string{"list:mid:1", "wait:3s", "download:101", "wait:3s", "download:102"}
+	if strings.Join(*events, ",") != strings.Join(want, ",") {
+		t.Errorf("事件流 = %v, want %v", *events, want)
+	}
+}
+
+// TestSubCheckDelayCancelDuringWait 钉住取消语义：停顿期间 ctx 被取消 → 错误原样上抛
+// （context.Canceled），既不能吞掉，也不能接着去下载。
+func TestSubCheckDelayCancelDuringWait(t *testing.T) {
+	setSubStoreRoot(t, t.TempDir())
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 0
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origSleep := subCheckSleep
+	subCheckSleep = func(c context.Context, _ time.Duration) error {
+		cancel() // 在第一次停顿期间取消
+		return c.Err()
+	}
+	t.Cleanup(func() { subCheckSleep = origSleep })
+
+	var downloaded bool
+	subs := []substore.Subscription{{Target: "mid:1", Name: "a"}}
+	deps := subCheckDeps{
+		resolve: func(_ context.Context, target string) (string, error) { return target, nil },
+		fetch: func(_ context.Context, resolved string) (*entity.VInfo, error) {
+			return &entity.VInfo{Title: resolved, PagesInfo: []entity.Page{{Aid: "101", PubTime: time.Now().Unix()}}}, nil
+		},
+		download: func(context.Context, string) error { downloaded = true; return nil },
+	}
+	_, err := subCheckRun(ctx, subs, deps, subCheckSchedule{Concurrency: 1, DelayPerItem: time.Second}, time.Now())
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("停顿期间取消应当原样上抛 context.Canceled，实际 %v", err)
+	}
+	if downloaded {
+		t.Error("取消之后不该继续下载")
+	}
+}

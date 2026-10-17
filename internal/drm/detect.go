@@ -45,6 +45,10 @@ func (a Asset) Found() bool { return a.Path != "" && a.Source != AssetMissing }
 type Assets struct {
 	Mp4decrypt Asset
 	Wvd        Asset
+	// ExplicitMp4decrypt / ExplicitWvd 记录用户**显式给出**的路径原文（t90）：
+	// 路径打错时前置检查要能点名「你给的这个路径不存在」，而不是只说「缺 mp4decrypt」。
+	ExplicitMp4decrypt string
+	ExplicitWvd        string
 }
 
 // BundledFileName 是随发布包内置的 Widevine 设备文件名（与上游一致）。
@@ -59,6 +63,8 @@ func ResolveAssets(exeDir, explicitMp4decrypt, explicitWvd string) Assets {
 	var out Assets
 	out.Mp4decrypt = resolveOne(exeDir, explicitMp4decrypt, "mp4decrypt", true)
 	out.Wvd = resolveWvd(exeDir, explicitWvd)
+	out.ExplicitMp4decrypt = strings.TrimSpace(explicitMp4decrypt)
+	out.ExplicitWvd = strings.TrimSpace(explicitWvd)
 	return out
 }
 
@@ -144,10 +150,17 @@ func CheckDecryptPrerequisites(assets Assets, keyHex, kidHex string) error {
 
 	if !assets.Mp4decrypt.Found() {
 		missing = append(missing, "mp4decrypt")
+		if assets.ExplicitMp4decrypt != "" {
+			hints = append(hints, fmt.Sprintf("你显式指定的路径 %q 不存在或不是文件（--mp4decrypt-path）；请检查拼写，或去掉该选项改从 PATH/程序目录查找", assets.ExplicitMp4decrypt))
+		}
 		hints = append(hints, Mp4decryptInstallHint())
 	}
 	if !manual && !assets.Wvd.Found() {
 		missing = append(missing, BundledFileName)
+		if assets.ExplicitWvd != "" {
+			// t90：点名「你给的路径」——只说缺 device.wvd，用户会以为自己已经指定了。
+			hints = append(hints, fmt.Sprintf("你显式指定的路径 %q 不存在或不是文件（--wvd-path）；请检查拼写，或去掉该选项改用程序目录", assets.ExplicitWvd))
+		}
 		hints = append(hints,
 			"把 "+BundledFileName+" 放到程序目录（发布包内置）或用 --wvd-path 指定它的路径",
 			"也可以直接用 --key <hex> --kid <hex> 手动提供密钥，这样不需要 "+BundledFileName)

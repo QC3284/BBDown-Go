@@ -1,5 +1,14 @@
 package util
 
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/QC3284/BBDown-Go/internal/entity"
+)
+
 // subtitleLangMap maps Bilibili subtitle language keys to (ISO639 code, display name),
 // ported from the upstream C# SubUtil.GetSubtitleCode table.
 var subtitleLangMap = map[string][2]string{
@@ -176,4 +185,218 @@ func GetSubtitleCode(key string) (string, string) {
 func SubCode2(key string) string {
 	code, _ := GetSubtitleCode(key)
 	return code
+}
+
+// ---- t78：字幕筛选（吸收 BBDownT SubtitleSelection）----
+//
+// 两个独立开关：
+//   --subtitle-language <逗号分隔>：按语言筛。短标签（zh / en）按**语言族**匹配——
+//     ai-zh 归 zh 族、zh-CN/zh-Hant 也归 zh 族；带连字符的标签（zh-Hans）按**精确**匹配，
+//     不会再吃掉同族的其它变体。
+//   --ai-subtitle-policy exclude|include|prefer-human|only：AI 字幕策略，语义照 BBDownT
+//     FilterCandidates；显式给出时**优先于** --skip-ai（旧的 --skip-ai 单独使用时行为不变）。
+//
+// 两个开关都是纯函数判定 + 一个统一的筛选层，方便逐格断言。
+
+// AISubtitlePolicy 是 --ai-subtitle-policy 的取值（空串 = 未指定）。
+type AISubtitlePolicy string
+
+const (
+	// AISubtitleUnset 表示没给 --ai-subtitle-policy（行为交给 --skip-ai / 默认全留）。
+	AISubtitleUnset AISubtitlePolicy = ""
+	// AISubtitleExclude 过滤掉所有 AI 字幕。
+	AISubtitleExclude AISubtitlePolicy = "exclude"
+	// AISubtitleInclude 全留（AI 与人工都保留）。
+	AISubtitleInclude AISubtitlePolicy = "include"
+	// AISubtitlePreferHuman 在**同一语言族**里有人工字幕时弃掉该族的 AI 字幕。
+	AISubtitlePreferHuman AISubtitlePolicy = "prefer-human"
+	// AISubtitleOnly 只留 AI 字幕。
+	AISubtitleOnly AISubtitlePolicy = "only"
+)
+
+// subtitleLanguageRe 校验语言标签：BCP-47 风格的子集（zh / en / zh-Hans / ai-zh / zh-CN）。
+// 与 BBDownT 的正则同口径：主标签 2-8 个字母，可选若干个「-」分隔的 1-8 位字母数字子标签。
+var subtitleLanguageRe = regexp.MustCompile("^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+
+// ParseSubtitleLanguages 解析 --subtitle-language：逗号分隔、去空白、去重保序、逐个校验。
+// 空串返回 nil（= 不按语言筛）。非法标签的报错里带选项名与合法形态。
+func ParseSubtitleLanguages(spec string) ([]string, error) {
+	raw := strings.TrimSpace(spec)
+	if raw == "" {
+		return nil, nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		tag := strings.TrimSpace(part)
+		if tag == "" {
+			continue
+		}
+		if !subtitleLanguageRe.MatchString(tag) {
+			return nil, fmt.Errorf("--subtitle-language %q 无效：请用语言标签（如 zh / en / zh-Hans / ai-zh）", tag)
+		}
+		key := strings.ToLower(tag)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, tag)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--subtitle-language %q 无效：至少要给一个语言标签（如 zh,en）", spec)
+	}
+	return out, nil
+}
+
+// ParseAISubtitlePolicy 解析 --ai-subtitle-policy；空串 = 未指定（返回 AISubtitleUnset）。
+func ParseAISubtitlePolicy(spec string) (AISubtitlePolicy, error) {
+	switch p := AISubtitlePolicy(strings.ToLower(strings.TrimSpace(spec))); p {
+	case AISubtitleUnset, AISubtitleExclude, AISubtitleInclude, AISubtitlePreferHuman, AISubtitleOnly:
+		return p, nil
+	default:
+		return AISubtitleUnset, fmt.Errorf("--ai-subtitle-policy %q 无效：可选 exclude / include / prefer-human / only", spec)
+	}
+}
+
+// subtitleIsAI 判定一条字幕是不是 AI 生成（B 站的约定：ai- 前缀，如 ai-zh / ai-En）。
+func subtitleIsAI(lan string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(lan)), "ai-")
+}
+
+// stripAIPrefix 去掉 ai- 前缀（保留其余标签大小写）。
+func stripAIPrefix(lan string) string {
+	l := strings.TrimSpace(lan)
+	if subtitleIsAI(l) {
+		return l[len("ai-"):]
+	}
+	return l
+}
+
+// SubtitleLanguageFamily 返回语言族：去掉 ai- 前缀后取主标签并小写。
+// 例：ai-zh → zh；zh-Hans → zh；en-US → en；空串 → 空串。
+func SubtitleLanguageFamily(lan string) string {
+	base := stripAIPrefix(lan)
+	if i := strings.IndexByte(base, '-'); i > 0 {
+		base = base[:i]
+	}
+	return strings.ToLower(base)
+}
+
+// SubtitleLanguageMatches 判定一条字幕的语言是否命中 --subtitle-language 的某一项。
+//
+//   - want 是短标签（不含「-」）：按**语言族**匹配（zh 命中 zh-CN / zh-Hant / ai-zh）；
+//   - want 含「-」（如 zh-Hans）：按**精确**匹配（只比去掉 ai- 前缀后的标签本身，不再放宽到族）。
+func SubtitleLanguageMatches(lan, want string) bool {
+	w := strings.TrimSpace(want)
+	if w == "" {
+		return true
+	}
+	base := stripAIPrefix(lan)
+	if strings.ContainsRune(w, '-') {
+		return strings.EqualFold(base, w)
+	}
+	return strings.EqualFold(SubtitleLanguageFamily(lan), SubtitleLanguageFamily(w))
+}
+
+// FilterSubtitles 是统一的字幕筛选层（纯函数）：先按语言筛，再按 AI 策略筛，保持原顺序。
+//
+// prefer-human 的判据：「同一语言族里存在人工（非 AI）字幕」。空语言（未知来源）**不算**
+// 人工字幕——否则一条来源不明的条目会把该族的 AI 字幕顶掉（BBDownT FilterCandidates 同款）。
+func FilterSubtitles(subs []entity.Subtitle, languages []string, policy AISubtitlePolicy) []entity.Subtitle {
+	filtered := make([]entity.Subtitle, 0, len(subs))
+	for _, s := range subs {
+		if len(languages) == 0 {
+			filtered = append(filtered, s)
+			continue
+		}
+		matched := false
+		for _, want := range languages {
+			if SubtitleLanguageMatches(s.Lan, want) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			filtered = append(filtered, s)
+		}
+	}
+
+	switch policy {
+	case AISubtitleExclude:
+		return dropWhere(filtered, func(s entity.Subtitle) bool { return subtitleIsAI(s.Lan) })
+	case AISubtitleOnly:
+		return dropWhere(filtered, func(s entity.Subtitle) bool { return !subtitleIsAI(s.Lan) })
+	case AISubtitlePreferHuman:
+		humanFamilies := make(map[string]bool, len(filtered))
+		for _, s := range filtered {
+			lan := strings.TrimSpace(s.Lan)
+			if lan == "" || subtitleIsAI(lan) {
+				continue // 未知来源/空语言不算人工字幕
+			}
+			humanFamilies[SubtitleLanguageFamily(lan)] = true
+		}
+		return dropWhere(filtered, func(s entity.Subtitle) bool {
+			return subtitleIsAI(s.Lan) && humanFamilies[SubtitleLanguageFamily(s.Lan)]
+		})
+	default: // unset / include：两种都全留
+		return filtered
+	}
+}
+
+func dropWhere(subs []entity.Subtitle, drop func(entity.Subtitle) bool) []entity.Subtitle {
+	out := make([]entity.Subtitle, 0, len(subs))
+	for _, s := range subs {
+		if drop(s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// EffectiveSkipAi 是「显式 --ai-subtitle-policy 优先于 --skip-ai」的判定（t78）：
+// policy 非空时 --skip-ai 不再生效（策略已经决定 AI 字幕的去留）；policy 为空时维持原语义。
+//
+// 说明：真正把这条用在下载链路上，需要 workflow 的 SkipAi 过滤前调用它（那一步不在 t78 的
+// inScope 里）；这里先把判定做成可测的纯函数，接线只差一行。
+func EffectiveSkipAi(policy AISubtitlePolicy, skipAi bool) bool {
+	if policy != AISubtitleUnset {
+		return false
+	}
+	return skipAi
+}
+
+// ---- 选择状态的接线（GetSubtitles 返回前统一筛选）----
+
+var (
+	subtitleSelectionMu        sync.RWMutex
+	subtitleSelectionLanguages []string
+	subtitleSelectionPolicy    AISubtitlePolicy
+)
+
+// SetSubtitleSelection 由 CLI 侧调用，写入本次运行的字幕选择（空值 = 不筛选，行为与改前一致）。
+func SetSubtitleSelection(languages []string, policy AISubtitlePolicy) {
+	subtitleSelectionMu.Lock()
+	defer subtitleSelectionMu.Unlock()
+	subtitleSelectionLanguages = append([]string(nil), languages...)
+	subtitleSelectionPolicy = policy
+}
+
+// SubtitleSelection 读取当前选择（导出给编排层接线用；返回副本，避免调用方改到内部状态）。
+func SubtitleSelection() ([]string, AISubtitlePolicy) {
+	subtitleSelectionMu.RLock()
+	defer subtitleSelectionMu.RUnlock()
+	return append([]string(nil), subtitleSelectionLanguages...), subtitleSelectionPolicy
+}
+
+// subtitleSelection 内部别名（t78 原有调用点）。
+func subtitleSelection() ([]string, AISubtitlePolicy) { return SubtitleSelection() }
+
+// applySubtitleSelection 在 GetSubtitles 返回前应用选择（两个开关都未设时原样返回）。
+func applySubtitleSelection(subs []entity.Subtitle) []entity.Subtitle {
+	languages, policy := subtitleSelection()
+	if len(languages) == 0 && policy == AISubtitleUnset {
+		return subs
+	}
+	return FilterSubtitles(subs, languages, policy)
 }

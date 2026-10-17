@@ -99,7 +99,7 @@ var serveCmd = &cobra.Command{
 		ctx := commandContext(cmd)
 
 		// Fire-and-forget update check (upstream ServeCommand).
-		util.CheckUpdateAsync(ctx, buildHTTPClient(config.MyOption{}), "v3.0.1")
+		util.CheckUpdateAsync(ctx, buildHTTPClient(config.MyOption{}), "v3.1.0")
 
 		err := srv.Run(ctx)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -373,7 +373,9 @@ func runWatchLater(cmd *cobra.Command, args []string) error {
 		opt.UseIntlAPI = cfg.UseIntlAPI
 		opt.WorkDir = cfg.WorkDir
 		opt.Wbi = watchLaterWbi
-		if err := workflow.New(opt, client).Run(ctx); err != nil {
+		wf := workflow.New(opt, client)
+		wf.SetAudioLanguage(optAudioLanguage) // t79：与主下载路径同一开关
+		if err := wf.Run(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return silenceOnCancel(cmd, err)
 			}

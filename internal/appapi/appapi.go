@@ -7,7 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/QC3284/BBDown-Go/internal/util"
 )
@@ -41,6 +44,13 @@ const (
 	codeAV1 = 3
 )
 
+// 端点接缝：变量而非常量，离线用例注入假 gRPC 服务（同 internal/fetcher 里那些接缝）；
+// 生产路径就是上面两个常量。
+var (
+	appUGCAPI = apiUGC
+	appPGCAPI = apiPGC
+)
+
 func getVideoCodeType(code string) int {
 	switch code {
 	case "AVC":
@@ -56,6 +66,115 @@ func getVideoCodeType(code string) int {
 
 // DoReq performs the APP playurl request and returns the web-style dash JSON
 // (upstream AppHelper.DoReqAsync + ConvertToDashJson).
+// grpcStatusReason 把常用的 gRPC 状态码翻译成一句人话（其余只给数字）。
+func grpcStatusReason(code int) string {
+	switch code {
+	case 1:
+		return "CANCELLED(请求被取消)"
+	case 3:
+		return "INVALID_ARGUMENT(参数不合法)"
+	case 4:
+		return "DEADLINE_EXCEEDED(超时)"
+	case 5:
+		return "NOT_FOUND(资源不存在)"
+	case 7:
+		return "PERMISSION_DENIED(权限拒绝)"
+	case 8:
+		return "RESOURCE_EXHAUSTED(配额/限流)"
+	case 9:
+		return "FAILED_PRECONDITION(前置条件不满足)"
+	case 12:
+		return "UNIMPLEMENTED(接口未实现)"
+	case 13:
+		return "INTERNAL(服务端内部错误)"
+	case 14:
+		return "UNAVAILABLE(服务不可用)"
+	case 16:
+		return "UNAUTHENTICATED(未认证/登录态无效)"
+	default:
+		return "未知状态"
+	}
+}
+
+// grpcStatusFromHeaders 从响应头与 trailer 里取 (grpc-status, grpc-message)。
+//
+// 规范位置是 trailer（HTTP/2 trailers，Go 在读完 body 后填充 resp.Trailer），但有些网关会把
+// 它放进响应头，所以两处都看：trailer 优先，header 兜底。
+func grpcStatusFromHeaders(header, trailer http.Header) (int, string, bool) {
+	get := func(h http.Header, key string) string {
+		if h == nil {
+			return ""
+		}
+		return strings.TrimSpace(h.Get(key))
+	}
+	for _, h := range []http.Header{trailer, header} {
+		raw := get(h, "grpc-status")
+		if raw == "" {
+			continue
+		}
+		code, err := strconv.Atoi(raw)
+		if err != nil {
+			continue // 非数字：不认，按「没有 grpc-status」处理（不猜）
+		}
+		return code, get(h, "grpc-message"), true
+	}
+	return 0, "", false
+}
+
+// throwIfGRPCStatusFails 把「HTTP 200 + grpc-status 非 0」翻成可读错误（t70，上游 1.7.4）。
+//
+// 这类响应 body 往往是空的，直接交给 readMessage 只会得到「gRPC response too short」——
+// 用户看到的是「数据损坏」，而真实原因是权限/登录/大会员被拒。
+func throwIfGRPCStatusFails(header, trailer http.Header) error {
+	code, message, ok := grpcStatusFromHeaders(header, trailer)
+	if !ok || code == 0 {
+		return nil
+	}
+	detail := "grpc-status=" + strconv.Itoa(code) + ": " + grpcStatusReason(code)
+	if message != "" {
+		detail += "（服务端消息: " + message + "）"
+	}
+	return fmt.Errorf("gRPC 调用被拒绝：%s。服务端返回了 HTTP 200，但业务层拒绝了这次请求"+
+		"（常见原因：未登录/登录态失效、大会员或地区限制、接口参数不被接受）；这不是数据损坏", detail)
+}
+
+// postGRPC 发一次 gRPC 调用并返回 body + 响应头 + trailer。
+//
+// 为什么不用 client.PostResponse：它只回 body。这里用 client.DownloadClient() 的底层 client
+// 自己发（请求本身是 token 鉴权、不带 cookie，也没有重定向，所以不踩那个 client 的凭据守卫）；
+// 代价是没有内置超时，因此这里套一个 2 分钟上限（与 DRM 取钥窗口同量级），避免挂死。
+func postGRPC(ctx context.Context, client *util.HTTPClient, endpoint string, body []byte, headers map[string]string) ([]byte, http.Header, http.Header, error) {
+	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(runCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/grpc")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	util.LogDebug("POST %s (%d bytes)", endpoint, len(body))
+
+	resp, err := client.DownloadClient().Do(req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, resp.Header, resp.Trailer, fmt.Errorf("HTTP %d from %s", resp.StatusCode, util.MaskUrl(endpoint))
+	}
+	payload, err := util.ReadAllBounded(resp.Body, 8<<20)
+	if err != nil {
+		return nil, resp.Header, resp.Trailer, err
+	}
+	// 读完 body 之后 trailer 才到齐，这时取出来的才是完整的。
+	return payload, resp.Header, resp.Trailer, nil
+}
+
 func DoReq(ctx context.Context, client *util.HTTPClient, aid, cid, epID, qn string, bangumi bool, encoding, token string) (string, error) {
 	parseID := func(value, name string) (int64, error) {
 		n, err := strconv.ParseInt(value, 10, 64)
@@ -84,7 +203,7 @@ func DoReq(ctx context.Context, client *util.HTTPClient, aid, cid, epID, qn stri
 			return "", err
 		}
 		payload = encodePlayViewReq(numEp, numCid, numQn, code265)
-		endpoint = apiPGC
+		endpoint = appPGCAPI
 	} else {
 		numAid, err := parseID(aid, "aid")
 		if err != nil {
@@ -99,17 +218,30 @@ func DoReq(ctx context.Context, client *util.HTTPClient, aid, cid, epID, qn stri
 			return "", err
 		}
 		payload = encodePlayViewReq(numAid, numCid, numQn, getVideoCodeType(encoding))
-		endpoint = apiUGC
+		endpoint = appUGCAPI
 	}
 
 	headers := getHeader(token)
 	body := packMessage(payload)
-	resp, err := client.PostResponse(ctx, endpoint, body, headers)
+	// t70（吸收上游 1.7.4）：这里不能用 client.PostResponse —— 它只回 body，把 header/trailer
+	// 丢了；而 gRPC 的失败信息恰恰在 trailer 里（HTTP 200 + grpc-status 非 0）。自己发一次，
+	// 把两个头都带回来。
+	respBody, respHeader, respTrailer, err := postGRPC(ctx, client, endpoint, body, headers)
 	if err != nil {
 		return "", err
 	}
-	msg, err := readMessage(resp)
+	// gRPC 层拒绝优先于「解析失败」：HTTP 200 + grpc-status 非 0 是权限/业务拒绝，
+	// 报成「protobuf 损坏」会把排查方向带偏（上游 1.7.4 修的正是这个）。
+	if err := throwIfGRPCStatusFails(respHeader, respTrailer); err != nil {
+		return "", err
+	}
+	msg, err := readMessage(respBody)
 	if err != nil {
+		// trailer 是**读完 body 之后**才到齐的（Go 的 resp.Trailer 在 ReadAll 后才填充），
+		// 所以解析失败时再查一次，确保不会漏掉晚到的 grpc-status。
+		if gerr := throwIfGRPCStatusFails(respHeader, respTrailer); gerr != nil {
+			return "", gerr
+		}
 		return "", err
 	}
 	return convertToDashJSON(msg)

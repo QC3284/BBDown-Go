@@ -48,7 +48,10 @@ func GetSubtitles(ctx context.Context, client *HTTPClient, aid, cid, epid string
 			subtitles[i].URL = "https:" + subtitles[i].URL
 		}
 	}
-	return subtitles, nil
+	// t78：统一在这里应用 --subtitle-language / --ai-subtitle-policy（两者都未设时原样返回，
+	// 行为与改前逐字一致）。放在 GetSubtitles 里而不是调用方，是为了让三条解析路径
+	// （新接口 / 老三条 / INTL）都吃到同一层筛选。
+	return applySubtitleSelection(subtitles), nil
 }
 
 func getSubAPI1(ctx context.Context, client *HTTPClient, aid, cid string) []entity.Subtitle {

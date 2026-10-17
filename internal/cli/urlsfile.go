@@ -7,6 +7,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/QC3284/BBDown-Go/internal/util"
 )
 
 // F2 批量输入（本仓新功能，见 docs/ROADMAP.md）：位置参数可以给多个 URL，也可以用
@@ -61,11 +64,25 @@ func collectTargets(args []string, urlsFile string, stdin io.Reader) ([]string, 
 
 // runTargets 顺序执行多个目标：单个失败只记日志并继续（与 `sub check` 的批量语义一致），
 // 返回失败数。ctx 取消则立即停下（返回已发生的失败数），不吞掉取消原因。
+// batchDelayPerVideo 是批量下载「视频之间」的间隔（t80，--delay-per-video 的落地值）：
+// 由 runDownload 在发请求前按 flag 解析写入；默认取 BBDownT 的 10 秒，0 = 不等待。
+// 与 sub check 的 --delay-per-item 完全独立（那是另一个循环、另一个接缝）。
+var batchDelayPerVideo = time.Duration(defaultDelayPerVideo) * time.Second
+
 func runTargets(ctx context.Context, targets []string, run func(context.Context, string) error) int {
 	failures := 0
+	waited := false
 	for i, target := range targets {
 		if ctx.Err() != nil {
 			break
+		}
+		// t80：目标之间按 batchDelayPerVideo 停顿；**首个目标不等待**（间隔是为了摊开连发，
+		// 不是给第一个动作加延迟）。等待期间取消 → 记日志后退出，不把取消吞掉。
+		if batchDelayPerVideo > 0 && waited {
+			if err := batchSleep(ctx, batchDelayPerVideo); err != nil {
+				util.LogWarn("批量下载在间隔期间被取消：%v", err)
+				break
+			}
 		}
 		if len(targets) > 1 {
 			fmt.Printf("[%d/%d] %s\n", i+1, len(targets), target)
@@ -73,6 +90,7 @@ func runTargets(ctx context.Context, targets []string, run func(context.Context,
 		if err := run(ctx, target); err != nil {
 			failures++
 		}
+		waited = true
 	}
 	return failures
 }

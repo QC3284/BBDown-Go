@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/QC3284/BBDown-Go/internal/config"
 	"github.com/QC3284/BBDown-Go/internal/entity"
+	"github.com/QC3284/BBDown-Go/internal/muxer"
+	"github.com/QC3284/BBDown-Go/internal/util"
 )
 
 func TestParsePageSelection(t *testing.T) {
@@ -243,5 +246,195 @@ func TestGetSelectedPagesNormalizesLeadingZeros(t *testing.T) {
 	got2, err := getSelectedPages(cfg2, &entity.VInfo{}, "")
 	if err != nil || got2 != nil {
 		t.Errorf("未指定分P 应当是 ALL(nil)，实际 %v err=%v", got2, err)
+	}
+}
+
+// ---- t69：登录横幅按「模式 + 已加载 token」分流（吸收上游 1.7.5）----
+
+// TestDecideLoginBannerMatrix 钉住组合矩阵：只有「已加载 token **且** 当前是 token 鉴权模式
+// （TV/APP/INTL）」才改打中性说明；其余一律维持原横幅。
+//
+// 为什么必须分流：x/web-interface/nav 只验证 web cookie，而 TV/APP/INTL 凭 access_token 鉴权——
+// 本地已有 TV token 的用户用 --use-tv-api 下载时会误报「未登录仅能试看 6 分钟」，实际 playurl
+// 完全成功。
+//
+// 变异验证：让 decideLoginBanner 无视 token 模式（永远返回原横幅）→ 本用例红。
+func TestDecideLoginBannerMatrix(t *testing.T) {
+	token := config.MyOption{AccessToken: "tv-token-abc"}
+	withToken := func(mod func(*config.MyOption)) config.MyOption {
+		c := token
+		mod(&c)
+		return c
+	}
+	cases := []struct {
+		name          string
+		cfg           config.MyOption
+		loggedIn      bool
+		cookieExpired bool
+		want          loginBannerKind
+	}{
+		{"已登录 → 不打任何横幅（TV 模式亦然）", config.MyOption{UseTvAPI: true}, true, false, loginBannerNone},
+		{"无 token + WEB 未登录 → 原横幅", config.MyOption{}, false, false, loginBannerNotLoggedIn},
+		{"无 token + WEB cookie 过期 → 原横幅", config.MyOption{}, false, true, loginBannerCookieExpired},
+		{"无 token + TV 模式 → 原横幅（TV 没 token 也下不了完整视频）", config.MyOption{UseTvAPI: true}, false, false, loginBannerNotLoggedIn},
+		{"有 token + TV → 中性说明", withToken(func(c *config.MyOption) { c.UseTvAPI = true }), false, false, loginBannerTokenMode},
+		{"有 token + APP → 中性说明", withToken(func(c *config.MyOption) { c.UseAppAPI = true }), false, false, loginBannerTokenMode},
+		{"有 token + INTL → 中性说明", withToken(func(c *config.MyOption) { c.UseIntlAPI = true }), false, false, loginBannerTokenMode},
+		{"有 token + TV + web cookie 过期 → 仍然是中性说明", withToken(func(c *config.MyOption) { c.UseTvAPI = true }), false, true, loginBannerTokenMode},
+		{"有 token 但纯 WEB 模式 → 原横幅（WEB 靠 cookie 鉴权）", token, false, false, loginBannerNotLoggedIn},
+		{"有 token 但纯 WEB + cookie 过期 → 原横幅", token, false, true, loginBannerCookieExpired},
+		{"token 只有空白 → 视为没有 token", config.MyOption{AccessToken: "   ", UseTvAPI: true}, false, false, loginBannerNotLoggedIn},
+	}
+	for _, c := range cases {
+		if got := decideLoginBanner(c.cfg, c.loggedIn, c.cookieExpired); got != c.want {
+			t.Errorf("%s：decideLoginBanner = %v, want %v（cfg=%+v）", c.name, got, c.want, c.cfg)
+		}
+	}
+}
+
+// TestLoginBannerLines 逐字钉住横幅文本：
+//   - token 模式的中性说明必须说明「实际用的是哪个模式」，且**绝不能**出现
+//     「未登录状态下仅能下载6分钟试看片段」（那正是误报）；
+//   - 原横幅（未登录 / cookie 过期）逐字不变。
+//
+// 变异验证：撤掉分流后 token 模式会走原横幅 → TestDecideLoginBannerMatrix 与本用例同时红。
+func TestLoginBannerLines(t *testing.T) {
+	tokenLines := strings.Join(loginBannerLines(loginBannerTokenMode, "TV"), "\n")
+	if tokenLines == "" {
+		t.Fatal("token 模式应当有横幅文本")
+	}
+	if strings.Contains(tokenLines, "仅能下载6分钟试看片段") {
+		t.Errorf("token 模式不能打「未登录仅能试看 6 分钟」：%q", tokenLines)
+	}
+	for _, want := range []string{"已加载 access_token", "TV 模式", "web cookie 只影响 WEB 模式", "可以忽略"} {
+		if !strings.Contains(tokenLines, want) {
+			t.Errorf("中性说明缺少 %q：%q", want, tokenLines)
+		}
+	}
+	// 说明里的模式名跟着实际模式走。
+	if app := strings.Join(loginBannerLines(loginBannerTokenMode, "APP"), "\n"); !strings.Contains(app, "APP 模式") {
+		t.Errorf("中性说明应当带上实际模式名：%q", app)
+	}
+
+	notLogged := strings.Join(loginBannerLines(loginBannerNotLoggedIn, "WEB"), "\n")
+	for _, want := range []string{"你尚未登录B站账号", "仅能下载6分钟试看片段", "BBDown login"} {
+		if !strings.Contains(notLogged, want) {
+			t.Errorf("原「未登录」横幅必须逐字保留 %q：%q", want, notLogged)
+		}
+	}
+	expired := strings.Join(loginBannerLines(loginBannerCookieExpired, "WEB"), "\n")
+	for _, want := range []string{"Cookie 已过期", "--use-tv-api 配合 --access-token"} {
+		if !strings.Contains(expired, want) {
+			t.Errorf("原「cookie 过期」横幅必须逐字保留 %q：%q", want, expired)
+		}
+	}
+	if got := loginBannerLines(loginBannerNone, "WEB"); len(got) != 0 {
+		t.Errorf("已登录时不该有任何横幅行：%v", got)
+	}
+}
+
+// TestFilterAiSubsPolicyOverridesSkipAi 钉住 t83 F1 的接线语义：
+// policy=only + --skip-ai=true → AI 字幕保留（policy 优先）；
+// policy 未设 + --skip-ai=true → 照旧过滤（--skip-ai 单独使用行为不变）；
+// 结束时恢复选择状态（不污染其它用例）。
+// 变异验证：把 filterAiSubs 改回忽略 policy（恒用 skipAi 裸过滤）→ 本用例红。
+func TestFilterAiSubsPolicyOverridesSkipAi(t *testing.T) {
+	defer util.SetSubtitleSelection(nil, util.AISubtitleUnset)
+	subs := []entity.Subtitle{{Lan: "ai-zh"}, {Lan: "zh-CN"}}
+
+	util.SetSubtitleSelection(nil, util.AISubtitleOnly)
+	got := filterAiSubs(subs, true, util.AISubtitleOnly)
+	if len(got) != 2 {
+		t.Fatalf("policy=only + skip-ai=true 应保留全部（policy 优先）：%+v", got)
+	}
+
+	util.SetSubtitleSelection(nil, util.AISubtitleUnset)
+	got = filterAiSubs(subs, true, util.AISubtitleUnset)
+	if len(got) != 1 || got[0].Lan != "zh-CN" {
+		t.Fatalf("policy 未设 + skip-ai=true 应照旧过滤 AI：%+v", got)
+	}
+
+	got = filterAiSubs(subs, false, util.AISubtitleUnset)
+	if len(got) != 2 {
+		t.Fatalf("skip-ai=false 应全保留：%+v", got)
+	}
+}
+
+// ---- t90（t82 评估 ⑤）：显式工具路径不存在时的告警 ----
+
+// TestToolPathWarningText 逐字钉住告警文本：点名选项、路径与回退目标。
+func TestToolPathWarningText(t *testing.T) {
+	got := toolPathWarning("--ffmpeg-path", "/no/such/ffmpeg", "改为从 PATH 查找 ffmpeg")
+	want := "--ffmpeg-path 指向的 \"/no/such/ffmpeg\" 不存在或不是文件，改为从 PATH 查找 ffmpeg（若这是笔误请修正）"
+	if got != want {
+		t.Errorf("告警文本 = %q", got)
+		t.Errorf("，期望     %q", want)
+	}
+}
+
+// TestFindBinariesWarnsOnMissingExplicitPaths 钉住行为：三个选项的显式路径不存在时都会告警
+// （aria2c 还会在告警后报错——它没有「回退到 PATH」这条路）。
+//
+// 变异验证：撤掉 findBinaries 里的 toolPathWarn 调用 → 本用例红（收不到告警）。
+func TestFindBinariesWarnsOnMissingExplicitPaths(t *testing.T) {
+	orig := toolPathWarn
+	var warns []string
+	toolPathWarn = func(optName, path, fallback string) { warns = append(warns, optName+"|"+path) }
+	t.Cleanup(func() { toolPathWarn = orig })
+
+	cfg := config.DefaultMyOption()
+	cfg.SkipMux = true // 只测告警本身，不触 PATH 查找（环境无关）
+	cfg.FFmpegPath = "/no/such/ffmpeg"
+	cfg.Mp4boxPath = "/no/such/MP4Box"
+	w := New(cfg, nil)
+	if err := w.findBinaries(); err != nil {
+		t.Fatalf("SkipMux 时不该报错：%v", err)
+	}
+	if len(warns) != 2 {
+		t.Fatalf("应当有两条告警（ffmpeg/mp4box），实际 %d：%v", len(warns), warns)
+	}
+	if warns[0] != "--ffmpeg-path|/no/such/ffmpeg" || warns[1] != "--mp4box-path|/no/such/MP4Box" {
+		t.Errorf("告警没有点名选项/路径：%v", warns)
+	}
+
+	// aria2c：显式路径不存在 → 先告警、再报错（错误文案保持原样）。
+	warns = nil
+	cfg2 := config.DefaultMyOption()
+	cfg2.SkipMux = true
+	cfg2.UseAria2c = true
+	cfg2.Aria2cPath = "/no/such/aria2c"
+	err := New(cfg2, nil).findBinaries()
+	if err == nil || !strings.Contains(err.Error(), "找不到可执行的aria2c文件") {
+		t.Fatalf("aria2c 显式路径不存在必须报错（原文案）：%v", err)
+	}
+	if len(warns) != 1 || warns[0] != "--aria2c-path|/no/such/aria2c" {
+		t.Errorf("aria2c 告警不合格：%v", warns)
+	}
+}
+
+// TestFindBinariesNoWarnWhenPathExists 钉住另一半：路径真实存在时一条告警也不该有
+// （既有行为不变——测试二进制本身就是个合法文件）。
+func TestFindBinariesNoWarnWhenPathExists(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("拿不到测试二进制路径：%v", err)
+	}
+	orig := toolPathWarn
+	var warns []string
+	toolPathWarn = func(optName, path, fallback string) { warns = append(warns, optName+"|"+path) }
+	t.Cleanup(func() { toolPathWarn = orig })
+
+	cfg := config.DefaultMyOption()
+	cfg.SkipMux = true
+	cfg.FFmpegPath = exe
+	cfg.Mp4boxPath = exe
+	if err := New(cfg, nil).findBinaries(); err != nil {
+		t.Fatalf("findBinaries: %v", err)
+	}
+	if len(warns) != 0 {
+		t.Errorf("路径存在时不该有告警：%v", warns)
+	}
+	if muxer.FFMPEG != exe || muxer.MP4BOX != exe {
+		t.Errorf("显式路径应当被采用：FFMPEG=%q MP4BOX=%q", muxer.FFMPEG, muxer.MP4BOX)
 	}
 }

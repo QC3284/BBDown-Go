@@ -44,6 +44,12 @@ type Workflow struct {
 	// initRequestSession; used to sign playurl/space requests.
 	sessionWbi string
 
+	// audioLanguage 是 CLI 传入的 --audio-language 原始值（未校验的字符串）；
+	// audioLanguageConfirmed 是本页解析后**确认可用**的语言代码（空 = 未选择/默认语言不改名），
+	// 只有它非空时 pageArtifactPath 才加 .audio-<code> 后缀。见 audiolang.go。
+	audioLanguage          string
+	audioLanguageConfirmed string
+
 	// MetaHandler is invoked with the fetched video metadata (serve mode uses
 	// it to fill task Title/Pic/VideoPubTime).
 	MetaHandler func(*entity.VInfo)
@@ -73,6 +79,12 @@ type Workflow struct {
 // New creates a new Workflow.
 func New(cfg config.MyOption, client *util.HTTPClient) *Workflow {
 	return &Workflow{Cfg: cfg, HTTPClient: client}
+}
+
+// SetAudioLanguage 设置 --audio-language（t79）。不在这里校验：形态/组合校验在 Run 开头
+// 一次性做（ValidateAudioLanguageOptions），这样 serve 等其它入口也走同一条校验。
+func (w *Workflow) SetAudioLanguage(code string) {
+	w.audioLanguage = code
 }
 
 // InitSession prepares a session for non-download commands (watchlater / sub
@@ -118,9 +130,15 @@ func (w *Workflow) Run(ctx context.Context) error {
 	if err := w.validateNumericOptions(); err != nil {
 		return err
 	}
+	// t79：--audio-language 的形态与模式互斥必须在**任何网络请求之前**判定（与 --delay-per-item 同一纪律）。
+	if err := ValidateAudioLanguageOptions(w.audioLanguage, w.Cfg); err != nil {
+		return err
+	}
 	w.handleDeprecatedOptions()
 
 	// Apply config to HTTP client and working dir
+	// t95：解析层 cur_language 重请求的桥——把 --audio-language 传给 parser（空串 = 请求形态逐字不变）。
+	parser.SetRequestAudioLanguage(w.audioLanguage)
 	if err := w.applyConfig(); err != nil {
 		return err
 	}
@@ -277,7 +295,7 @@ func (w *Workflow) Run(ctx context.Context) error {
 			}
 			failedPages = append(failedPages, page.Index)
 		}
-		if w.Cfg.SaveArchivesToFile {
+		if w.useAidArchive() {
 			// The tracker holds the write back until every page of this aid is done.
 			if tracker.OnProcessed(page.Aid, success) {
 				w.saveAidArchived(page.Aid)
@@ -380,6 +398,15 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 			case <-time.After(retryDelay):
 			}
 			continue
+		}
+
+		// t79：配音语言。清单与当前语言都来自**同一份** playurl 文档（复用 result.WebJSONString，
+		// 不额外发请求）；选中的语言若不是当前语言，这里直接失败——本仓解析层还没有 cur_language
+		// 参数，静默保存默认音轨却挂所选语言后缀比不支持更糟。
+		audioLangs, currentAudioLang := ParseAudioLanguages(result.WebJSONString)
+		if err := w.resolveAudioLanguage(audioLangs, currentAudioLang); err != nil {
+			util.LogError("%v", err)
+			return false
 		}
 
 		// 充电专属视频试看检测（上游：在排序/打印/下载前拦截，避免把试看片段当成功产物）
@@ -501,6 +528,13 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 					}
 					tierVideoIdx = picked
 				}
+			}
+		}
+
+		// t79：可选配音语言清单（有清单才打；--print-urls/--info-json 是机器契约，不掺行）。
+		if (humanInfo || w.Cfg.OnlyShowInfo) && !w.Cfg.PrintURLs && !w.Cfg.InfoJSON {
+			for _, line := range AudioLanguageLines(audioLangs, currentAudioLang, currentAudioLang) {
+				util.Log("%s", line)
 			}
 		}
 
@@ -630,6 +664,8 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 		if w.Cfg.AudioOnly && !strings.HasSuffix(strings.ToLower(savePath), ".m4a") {
 			savePath += ".m4a"
 		}
+		// t79：语言后缀的唯一注入点（页面产物）。配音轨/背景音轨不经过这里，见 pageArtifactPath。
+		savePath = w.pageArtifactPath(savePath)
 		util.LogDebug("SavePath: %s", savePath)
 
 		// v3 的选中确认行（⑥）：预计总大小与输出路径。
@@ -755,15 +791,10 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 			// 字幕清单在显示阶段（v3 的「字幕: …」行）已经取过一次：这里复用同一份缓存，
 			// 多打一行绝不多打一次接口。
 			subs := w.subtitlesFor(ctx, page)
-			if w.Cfg.SkipAi && len(subs) > 0 {
-				var filtered []entity.Subtitle
-				for _, s := range subs {
-					if !strings.HasPrefix(s.Lan, "ai-") {
-						filtered = append(filtered, s)
-					}
-				}
-				subs = filtered
-			}
+			// 显式 --ai-subtitle-policy 优先于 --skip-ai（t78/t83 F1 的接线）：
+			// policy 给了就用 EffectiveSkipAi 综合判定，只有「未设 policy」时才按 SkipAi 裸过滤。
+			_, aiPolicy := util.SubtitleSelection()
+			subs = filterAiSubs(subs, w.Cfg.SkipAi, aiPolicy)
 			// 显式要字幕却一个字幕都没有时，必须说清楚——否则用户只看到「任务完成」却没有任何产物，
 			// 分不清「该视频没有字幕」「没登录」「被 SkipAi 过滤」和「下载失败」（真机实测踩到，见 §4.43）。
 			// 注意：必须在 SkipAi 过滤**之后**判断——AI 字幕可下（2.15.3）之后，默认 skip-ai
@@ -1409,23 +1440,92 @@ func (w *Workflow) initRequestSession(ctx context.Context) {
 		if newWbi != "" {
 			w.sessionWbi = newWbi
 		}
-		if !isLoggedIn {
-			if cookieExpired {
-				util.LogWarn("========================================")
-				util.LogWarn("  Cookie 已过期！")
-				util.LogWarn("  请运行 BBDown login 重新扫码登录以获取新 Cookie。")
-				util.LogWarn("  或者使用 --use-tv-api 配合 --access-token 下载。")
-				util.LogWarn("  （若已执行 BBDown logintv，请加上 --use-tv-api）")
-				util.LogWarn("========================================")
-			} else {
-				util.LogWarn("========================================")
-				util.LogWarn("  你尚未登录B站账号！")
-				util.LogWarn("  未登录状态下仅能下载6分钟试看片段。")
-				util.LogWarn("  请运行 BBDown login 扫码登录以获取完整视频。")
-				util.LogWarn("  （若已执行 BBDown logintv，请在下载命令中加上 --use-tv-api）")
-				util.LogWarn("========================================")
-			}
+		// t69（吸收上游 1.7.5）：横幅按「模式 + 是否已加载 token」分流。x/web-interface/nav 只
+		// 验证 **web cookie**，而 TV/APP/INTL 模式凭 access_token 鉴权——已加载 token 的用户
+		// 用 --use-tv-api 下载时，原来会误报「未登录仅能试看 6 分钟」，而 playurl 其实完全成功。
+		kind := decideLoginBanner(w.Cfg, isLoggedIn, cookieExpired)
+		modeName := parser.ParseModeName(w.Cfg.UseTvAPI, w.Cfg.UseAppAPI, w.Cfg.UseIntlAPI)
+		for _, line := range loginBannerLines(kind, modeName) {
+			util.LogWarn("%s", line)
 		}
+	}
+}
+
+// loginBannerKind 是「登录相关横幅」的判定结果。
+type loginBannerKind int
+
+const (
+	// loginBannerNone：已登录，什么都不打。
+	loginBannerNone loginBannerKind = iota
+	// loginBannerNotLoggedIn：web 未登录（原横幅）。
+	loginBannerNotLoggedIn
+	// loginBannerCookieExpired：web cookie 过期（原横幅）。
+	loginBannerCookieExpired
+	// loginBannerTokenMode：已加载 token 且当前是 token 鉴权模式（TV/APP/INTL）——中性说明。
+	loginBannerTokenMode
+)
+
+// tokenAuthMode 报告当前解析模式是否凭 access_token 鉴权（TV / APP / INTL）。
+// WEB 模式靠 cookie，所以即使有 token 也不算「token 模式」。
+func tokenAuthMode(cfg config.MyOption) bool {
+	return cfg.UseTvAPI || cfg.UseAppAPI || cfg.UseIntlAPI
+}
+
+// decideLoginBanner 按「模式 + 是否已加载 token」决定打哪种横幅（纯函数，组合矩阵可离线断言）：
+//   - web 登录成功 → 不打；
+//   - 已加载 token（--access-token / BBDownTV.data）**且**当前是 token 鉴权模式 → 中性说明，
+//     **不**再说「未登录只能试看 6 分钟」（上游 1.7.5）；
+//   - 其余（无 token、或纯 WEB 模式）→ 维持原横幅：未登录 / cookie 已过期。
+//
+// 注意顺序：loadCredentials() 在 initRequestSession() 之前跑，所以这里的 Cfg.AccessToken
+// 已经包含「从 BBDownTV.data 读出来」的那一种，不只是命令行显式给的那个。
+func decideLoginBanner(cfg config.MyOption, loggedIn, cookieExpired bool) loginBannerKind {
+	if loggedIn {
+		return loginBannerNone
+	}
+	if strings.TrimSpace(cfg.AccessToken) != "" && tokenAuthMode(cfg) {
+		return loginBannerTokenMode
+	}
+	if cookieExpired {
+		return loginBannerCookieExpired
+	}
+	return loginBannerNotLoggedIn
+}
+
+// loginBannerLines 把判定结果渲染成横幅文本（逐行）。
+//
+// 单独抽出来是为了让「TV/APP 模式不再出现『仅能下载6分钟试看片段』」这条能被**逐字**断言，
+// 而不是只能靠跑一遍真实登录检测。
+func loginBannerLines(kind loginBannerKind, modeName string) []string {
+	switch kind {
+	case loginBannerCookieExpired:
+		return []string{
+			"========================================",
+			"  Cookie 已过期！",
+			"  请运行 BBDown login 重新扫码登录以获取新 Cookie。",
+			"  或者使用 --use-tv-api 配合 --access-token 下载。",
+			"  （若已执行 BBDown logintv，请加上 --use-tv-api）",
+			"========================================",
+		}
+	case loginBannerNotLoggedIn:
+		return []string{
+			"========================================",
+			"  你尚未登录B站账号！",
+			"  未登录状态下仅能下载6分钟试看片段。",
+			"  请运行 BBDown login 扫码登录以获取完整视频。",
+			"  （若已执行 BBDown logintv，请在下载命令中加上 --use-tv-api）",
+			"========================================",
+		}
+	case loginBannerTokenMode:
+		return []string{
+			"========================================",
+			"  已加载 access_token，当前使用 " + modeName + " 模式解析（凭 token 鉴权）。",
+			"  web cookie 只影响 WEB 模式；" + modeName + " 模式无需 web 登录即可下载完整视频。",
+			"  上面若提示 web 未登录/Cookie 过期，可以忽略。",
+			"========================================",
+		}
+	default:
+		return nil
 	}
 }
 
@@ -2001,16 +2101,33 @@ func parsePageSelection(expr string) ([]string, error) {
 
 // findBinaries locates external tools (upstream FindBinaries: explicit paths,
 // then PATH lookup; missing muxer/aria2c binaries abort the task).
+// toolPathWarn 是「显式工具路径不存在」告警的出口（t90，t82 评估 ⑤）：默认打 Warn，用例
+// 替换它来逐字断言文案。三个选项共用同一句句式，避免用户在不同工具上看到不同说法。
+var toolPathWarn = func(optName, path, fallback string) {
+	util.LogWarn("%s", toolPathWarning(optName, path, fallback))
+}
+
+// toolPathWarning 是「显式工具路径不存在」的告警文本（t90）。抽成纯函数让用例逐字断言，
+// 也与其它选项共用同一句式。
+func toolPathWarning(optName, path, fallback string) string {
+	return fmt.Sprintf("%s 指向的 %q 不存在或不是文件，%s（若这是笔误请修正）", optName, path, fallback)
+}
+
 func (w *Workflow) findBinaries() error {
 	// Use user-specified paths if set
 	if w.Cfg.FFmpegPath != "" {
 		if info, err := os.Stat(w.Cfg.FFmpegPath); err == nil && !info.IsDir() {
 			muxer.FFMPEG = w.Cfg.FFmpegPath
+		} else {
+			// t90：显式路径打错时别静默——用户会以为用的是自己指定的那个 ffmpeg。
+			toolPathWarn("--ffmpeg-path", w.Cfg.FFmpegPath, "改为从 PATH 查找 ffmpeg")
 		}
 	}
 	if w.Cfg.Mp4boxPath != "" {
 		if info, err := os.Stat(w.Cfg.Mp4boxPath); err == nil && !info.IsDir() {
 			muxer.MP4BOX = w.Cfg.Mp4boxPath
+		} else {
+			toolPathWarn("--mp4box-path", w.Cfg.Mp4boxPath, "改为从 PATH 查找 mp4box")
 		}
 	}
 
@@ -2045,6 +2162,9 @@ func (w *Workflow) findBinaries() error {
 			}
 			w.Cfg.Aria2cPath = p
 		} else if info, err := os.Stat(w.Cfg.Aria2cPath); err != nil || info.IsDir() {
+			// t90：aria2c 没有「回退到 PATH」这条路（显式给了就用它），所以这里先点名路径再报错，
+			// 否则用户只看到「找不到可执行的aria2c文件」，不知道是自己的路径写错了。
+			toolPathWarn("--aria2c-path", w.Cfg.Aria2cPath, "aria2c 不会回退到其它位置，请修正路径")
 			return fmt.Errorf("找不到可执行的aria2c文件")
 		}
 	}
@@ -2209,7 +2329,7 @@ func lockPath(path string) func() {
 }
 
 func (w *Workflow) checkAidArchived(aid string) bool {
-	if !w.Cfg.SaveArchivesToFile {
+	if !w.useAidArchive() {
 		return false
 	}
 	data, err := os.ReadFile(filepath.Join(appDirFunc(), "BBDown.archives"))
@@ -2226,7 +2346,7 @@ func (w *Workflow) checkAidArchived(aid string) bool {
 
 // saveAidArchived records an aid as downloaded.
 func (w *Workflow) saveAidArchived(aid string) {
-	if !w.Cfg.SaveArchivesToFile {
+	if !w.useAidArchive() {
 		return
 	}
 	f, err := os.OpenFile(filepath.Join(appDirFunc(), "BBDown.archives"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -2278,4 +2398,18 @@ func readIntSafe(ctx context.Context) (int, bool) {
 	case v := <-ch:
 		return v, true
 	}
+}
+
+// filterAiSubs 抽出来供逐字判据（t83 F1 接线）：显式 --ai-subtitle-policy 优先于 --skip-ai。
+func filterAiSubs(subs []entity.Subtitle, skipAi bool, policy util.AISubtitlePolicy) []entity.Subtitle {
+	if !util.EffectiveSkipAi(policy, skipAi) || len(subs) == 0 {
+		return subs
+	}
+	var filtered []entity.Subtitle
+	for _, s := range subs {
+		if !strings.HasPrefix(s.Lan, "ai-") {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }

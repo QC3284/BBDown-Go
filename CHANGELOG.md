@@ -10,6 +10,32 @@
 [docs/UPSTREAM_ALIGNMENT.md](docs/UPSTREAM_ALIGNMENT.md) 的差异表逐条登记，
 候选清单与优先级见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## [3.1.0] - 2026-10-17
+
+**功能周期**（上游同步大批次：AliverAnme 1.7.4~1.7.7 + BBDownT 2.1.7 功能件，吸收与偏离逐条见 [§4.73](docs/UPSTREAM_ALIGNMENT.md)）。
+
+### 修复（同病吸收）
+
+- **aria2c 预分配残件误判完整**：大小相等 + `.aria2` 控制文件存在 → 判未完成（残缺不再进混流）；成功后清理、失败保留供续传。
+- **TV/APP/INTL token 用户误报「未登录仅能试看 6 分钟」**：按「模式 + 已加载 token」分流，原横幅逐字保留。
+- **gRPC HTTP 200 权限拒绝误报 protobuf 损坏**：响应同时查 grpc-status（trailer 优先），可读错误含状态码与原因。
+- **live 完整性**：截断长度前缀包拒绝；零媒体帧分段跳过（全零才失败）；合并产物按帧数守恒核对。
+- **下载硬化**：分片失败即取消兄弟在途分片（保留原始错误与取消语义）；成品完整跳过时回收跨模式残留（`.tmp`/`.tmp.meta`/`.NNN.vclip`/`.dec`，不删 `.aria2` 与 live 会话目录）。
+- **显式工具路径不存在时告警**（`--ffmpeg-path`/`--mp4box-path`/`--aria2c-path` 点名回退；DRM 补「你给的路径不存在」hint）。
+
+### 新增（吸收 BBDownT）
+
+- **`sub check --delay-per-item <秒>`**：订阅检查节流（0~600，默认 0 与现状逐字一致；并发路径仅节流下载）。
+- **`--subtitle-language` / `--ai-subtitle-policy`**：字幕语言筛选（族/精确匹配）与 AI 策略（exclude/include/prefer-human/only，显式时优先于 `--skip-ai`）。
+- **`--audio-language <代码>`**：配音语言选择 + 产物语言后缀（`.audio-<code>`）；解析层 cur_language 重请求与响应确认，绝不静默下错音轨。
+- **`--delay-per-video <秒>`**（默认 10）与 **`--download-all`**（UP 主空间清单逐条下载；`--save-archives-to-file` 既有实现未重复）。
+- **`BBDown self-update`（别名 `update`）**：查官方 Release → GitHub 资产 digest 校验（缺摘要即拒）→ 原子替换（Windows 失败回滚）；只换主二进制并提示补齐 DRM 资产。
+
+### 说明
+
+- 版本位：一批新功能 → **minor**（3.0.1 → 3.1.0）。
+- 候选（ROADMAP）：APP/INTL 的 cur_language、多线程续传+布局校验、`util.PostResponseWithHeaders` 收敛（postGRPC 的 412 文案/响应体上限）、tokenAuthMode 与 ParseModeName 单一定义。
+
 ## [3.0.1] - 2026-10-07
 
 **修复批次**（CLI 自适应终端宽度收尾 + 宽度表统一）。

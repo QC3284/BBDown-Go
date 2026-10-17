@@ -71,6 +71,9 @@ func TestRunTargetsContinuesAfterFailure(t *testing.T) {
 		return nil
 	}
 
+	oldDelay := batchDelayPerVideo
+	batchDelayPerVideo = 0
+	t.Cleanup(func() { batchDelayPerVideo = oldDelay })
 	failures := runTargets(context.Background(), []string{"a", "bad", "c"}, run)
 	if failures != 1 {
 		t.Errorf("失败数 = %d，期望 1", failures)

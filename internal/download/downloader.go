@@ -329,6 +329,101 @@ func (g *stallGuard) Read(p []byte) (int, error) {
 // Stop releases the watchdog; the underlying body keeps its own Close.
 func (g *stallGuard) Stop() { g.timer.Stop() }
 
+// aria2ControlPath 返回 aria2c 为某个目标文件留下的控制文件路径（默认 <文件>.aria2）。
+func aria2ControlPath(destPath string) string { return destPath + ".aria2" }
+
+// hasAria2ControlFile 报告目标文件旁边是否还有 aria2c 控制文件（= 上一次没下完）。
+func hasAria2ControlFile(destPath string) bool {
+	_, err := os.Stat(aria2ControlPath(destPath))
+	return err == nil
+}
+
+// existingDownloadComplete 判定「磁盘上已有完整文件，可以跳过下载」。
+//
+// 大小相等只是**必要条件**：aria2c 用「预分配 + 控制文件」续传，中断时磁盘上的文件可能已经
+// 等于远端总长，只有 <文件>.aria2 还在才说明它是残的。只看大小会把残件当完整件跳过，
+// 后面混流就会拿半个视频去 mux（上游 1.7.4 修的正是这个）。控制文件**保留**给 aria2c 续传。
+func existingDownloadComplete(destPath string, remoteSize int64) bool {
+	if remoteSize <= 0 {
+		return false
+	}
+	info, err := os.Stat(destPath)
+	if err != nil || info.Size() != remoteSize {
+		return false
+	}
+	return !hasAria2ControlFile(destPath)
+}
+
+// cleanupResidue 在「产物已完整、跳过下载」时回收各模式遗留的中间文件（t89，t82 评估 ③）。
+//
+// 删：
+//   - dest.tmp（单线程下载的断点文件）；
+//   - dest.tmp.meta（单线程续传清单，singleDownload 的 metaPath = tmp + ".meta"）；
+//   - dest.NNN.vclip（多线程分片，clipPath 的命名，仅匹配「数字+vclip」形态）；
+//   - dest.dec（DRM 解密的唯一临时件）；
+//   - dest.segs（live 分段根目录）——**仅当它是空目录**。
+//
+// 不删：
+//   - dest.aria2：它的存在本身就说明「上次没下完」，existingDownloadComplete 会判未完成，
+//     这个分支根本走不到；留着给 aria2c 续传（t68）；
+//   - live 的会话目录 dest.segs/session-*：里面有分段，可能是用户唯一的恢复副本
+//     （live.go 的 staleSessions 只告警不删，这里保持一致——只在根目录空了才收掉它）。
+func cleanupResidue(destPath string) {
+	removeIfExists := func(p string) {
+		if err := os.Remove(p); err == nil {
+			util.LogDebug("已清理残留: %s", p)
+		}
+	}
+	removeIfExists(destPath + ".tmp")
+	removeIfExists(destPath + ".tmp.meta")
+	removeIfExists(destPath + ".dec")
+
+	// 多线程分片：精确匹配 <base>.<数字>.vclip，避免误删同目录下的同名兄弟文件。
+	dir := filepath.Dir(destPath)
+	base := filepath.Base(destPath)
+	if entries, err := os.ReadDir(dir); err == nil {
+		prefix := base + "."
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".vclip") {
+				continue
+			}
+			mid := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".vclip")
+			if mid == "" {
+				continue
+			}
+			digits := true
+			for _, r := range mid {
+				if r < '0' || r > '9' {
+					digits = false
+					break
+				}
+			}
+			if digits {
+				removeIfExists(filepath.Join(dir, name))
+			}
+		}
+	}
+
+	// live 分段根目录：只在空目录时收掉（会话目录里的分段不碰）。
+	if entries, err := os.ReadDir(destPath + ".segs"); err == nil && len(entries) == 0 {
+		removeIfExists(destPath + ".segs")
+	}
+}
+
+// removeStaleAria2Control 在**非 aria2c** 路径成功落盘之后清掉遗留的 aria2 控制文件。
+//
+// 为什么要清：控制文件是「还有东西可以续」的凭证。文件已经被我们完整重写之后它就成了谎言——
+// 留着会让下一次判断永远按「未完成」处理（白重下），也会诱导 aria2c 拿旧偏移去续一个内容
+// 已经换了的文件。aria2c 自己的下载路径不调用它（续传凭证归 aria2c 自己管理）。
+func removeStaleAria2Control(destPath string) {
+	if hasAria2ControlFile(destPath) {
+		if err := os.Remove(aria2ControlPath(destPath)); err == nil {
+			util.LogDebug("已清理遗留的 aria2 控制文件: %s", aria2ControlPath(destPath))
+		}
+	}
+}
+
 func DownloadFile(ctx context.Context, url, destPath string, cfg DownloadConfig) error {
 	if cfg.UseAria2c {
 		util.LogDebug("Start downloading: %s", util.MaskUrl(url))
@@ -350,22 +445,41 @@ func DownloadFile(ctx context.Context, url, destPath string, cfg DownloadConfig)
 	}
 
 	pr, err := probeFile(ctx, url, cfg)
-	if err == nil && pr.size > 0 {
-		if info, statErr := os.Stat(destPath); statErr == nil && info.Size() == pr.size {
-			util.Log("%s 已存在, 跳过下载...", destPath)
-			return nil
-		}
+	if err == nil && pr.size > 0 && existingDownloadComplete(destPath, pr.size) {
+		util.Log("%s 已存在, 跳过下载...", destPath)
+		// t89（t82 评估 ③）：产物已完整时顺手回收各模式遗留的中间文件，避免磁盘垃圾与
+		// 「下次又续到旧前缀」的困惑。**不删** dest.aria2（它存在就说明未完成，跳过分支根本
+		// 走不到这里），**不删** live 的会话目录（可能是用户唯一的恢复副本）。
+		cleanupResidue(destPath)
+		return nil
+	}
+	// 走到这里说明要么没有本地文件、要么大小不符、要么大小相符但旁边还有 aria2 控制文件
+	// （= 预分配出来的残件）。后一种情况必须走下载：交给 aria2c 续传，或由单/多线程从头覆盖。
+	if err == nil && pr.size > 0 && hasAria2ControlFile(destPath) {
+		util.LogWarn("%s 大小已等于远端总长，但仍存在 aria2 控制文件，按**未完成**处理（续传或重下）", destPath)
 	}
 
 	if multi && pr.ranges && pr.size > int64(cfg.segmentSize())*1024*1024 {
 		err := multiThreadDownload(ctx, url, destPath, pr.size, cfg)
 		if err == ErrRangeNotSupported {
 			util.LogWarn("服务器可能并不支持多线程下载, 请使用 --multi-thread false")
-			return singleDownload(ctx, url, destPath, pr, cfg)
+			if err := singleDownload(ctx, url, destPath, pr, cfg); err != nil {
+				return err
+			}
+			removeStaleAria2Control(destPath)
+			return nil
 		}
+		if err != nil {
+			return err
+		}
+		removeStaleAria2Control(destPath)
+		return nil
+	}
+	if err := singleDownload(ctx, url, destPath, pr, cfg); err != nil {
 		return err
 	}
-	return singleDownload(ctx, url, destPath, pr, cfg)
+	removeStaleAria2Control(destPath)
+	return nil
 }
 
 // forceHTTPIfNeeded downgrades https to http only when the option is enabled
@@ -698,6 +812,46 @@ func rangeStart(contentRange string) int64 {
 	return -1
 }
 
+// shardGroup 管理一次多线程下载的分片生命周期（t89，t82 评估 ②）：
+// **首次**分片失败时取消其余在途分片，同时保留最初的失败原因（调用方最终看到的必须是它，
+// 而不是后面那堆 context.Canceled）。
+//
+// 为什么做成类型：取消与「保留原始错误」的语义要能被确定性用例钉住——用真服务器观察
+// 取消传播会受平台/时序影响（本机实测 handler 侧观察不稳定），机制层用纯逻辑测才可靠。
+type shardGroup struct {
+	mu     sync.Mutex
+	first  error
+	cancel context.CancelFunc
+}
+
+// newShardGroup 从父 ctx 派生可取消的 runCtx；调用方负责在结束时 cancel（defer）。
+func newShardGroup(parent context.Context) (*shardGroup, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &shardGroup{cancel: cancel}, ctx
+}
+
+// record 记录一次分片失败：只有**第一个**错误会被保留，并在那一刻取消其余在途分片。
+// 返回是否为首个错误（调用方据此决定是否打印/计数）。
+func (g *shardGroup) record(err error) bool {
+	g.mu.Lock()
+	first := g.first == nil
+	if first {
+		g.first = err
+	}
+	g.mu.Unlock()
+	if first {
+		g.cancel()
+	}
+	return first
+}
+
+// err 返回首个错误（没有则 nil）。
+func (g *shardGroup) err() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.first
+}
+
 // multiThreadDownload downloads segments concurrently, validates range responses
 // and falls back to single-threaded download when the server ignores Range.
 func multiThreadDownload(ctx context.Context, url, destPath string, size int64, cfg DownloadConfig) error {
@@ -744,16 +898,16 @@ func multiThreadDownload(ctx context.Context, url, destPath string, size int64, 
 
 	sem := make(chan struct{}, maxConcurrentClips())
 	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
 	var notSupported atomic.Bool
 
+	// t89（t82 评估 ②）：任一在途分片失败就取消其余分片——否则它们会把整段白白下完
+	// （用户侧感受是「明明已经报错了还在跑」，同时白耗流量与时间）。取消的是派生 runCtx，
+	// 调用方传入的 ctx 不受影响，用户取消语义照旧透传。
+	group, runCtx := newShardGroup(ctx)
+	defer group.cancel()
+
 	recordErr := func(err error) {
-		errMu.Lock()
-		if firstErr == nil {
-			firstErr = err
-		}
-		errMu.Unlock()
+		group.record(err)
 	}
 
 	for _, clip := range clips {
@@ -766,12 +920,12 @@ func multiThreadDownload(ctx context.Context, url, destPath string, size int64, 
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
-			case <-ctx.Done():
-				recordErr(ctx.Err())
+			case <-runCtx.Done():
+				recordErr(runCtx.Err())
 				return
 			}
 
-			n, err := downloadRange(ctx, url, destPath, c, size, cfg, reportProgress(c.idx))
+			n, err := downloadRange(runCtx, url, destPath, c, size, cfg, reportProgress(c.idx))
 			if err == ErrRangeNotSupported {
 				notSupported.Store(true)
 				recordErr(err)
@@ -795,7 +949,7 @@ func multiThreadDownload(ctx context.Context, url, destPath string, size int64, 
 	// 等进度行擦干净再往下打日志：不等的话日志会和最后一帧挤在同一行。
 	<-progressStopped
 
-	if notSupported.Load() || firstErr != nil {
+	if firstErr := group.err(); notSupported.Load() || firstErr != nil {
 		for _, c := range clips {
 			os.Remove(clipPath(destPath, c.idx))
 		}

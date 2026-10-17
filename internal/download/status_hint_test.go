@@ -85,7 +85,7 @@ func TestMultiThread412CarriesActionableHint(t *testing.T) {
 
 	// HEAD 成功 + Accept-Ranges ⇒ 走分片路径（见 retry_policy_range_test.go 的 rangeFailServer）。
 	body := make([]byte, 3<<20)
-	srv, _ := rangeFailServer(t, body, http.StatusPreconditionFailed)
+	srv, _, _ := rangeFailServer(t, body, http.StatusPreconditionFailed)
 	cfg := DownloadConfig{Client: newTestClient(), MultiThread: true, SegmentSizeMB: 1, RetryCount: 3, RetryDelayMs: 1}
 	err := DownloadFile(context.Background(), srv.URL+"/v.m4s", filepath.Join(t.TempDir(), "out.bin"), cfg)
 	if err == nil {

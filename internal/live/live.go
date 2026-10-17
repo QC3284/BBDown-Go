@@ -240,6 +240,16 @@ func DownloadToFile(ctx context.Context, roomID, path string, client *util.HTTPC
 		segPath := filepath.Join(sessionDir, fmt.Sprintf("seg-%03d.flv", segIdx))
 		segIdx++
 		n, err := streamToFile(ctx, streamURL, segPath)
+		if err == nil {
+			// t72 ①：干净 EOF 也要核对长度前缀——CDN 在直播结束时往往直接断开，最后一个 FLV
+			// 标签的声明长度没被数据填满，那个分段就是**截断包**。已经写下的字节保留（可恢复），
+			// 但这里要按「被中断」处理：走重连/收尾逻辑，并在合并前把尾巴裁掉。
+			if res, serr := scanFLVFile(segPath); serr != nil {
+				util.LogDebug("分段 %s 不是可识别的 FLV（%v），按原样保留", segPath, serr)
+			} else if res.Truncated {
+				err = truncatedSegmentError(segPath, res)
+			}
+		}
 		if n > 0 {
 			// Keep whatever was written: a cancelled or interrupted segment is
 			// still recoverable content, and it takes part in the merge.
@@ -296,7 +306,26 @@ func DownloadToFile(ctx context.Context, roomID, path string, client *util.HTTPC
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return stateFor(total), err
 	}
+
+	// t72 ②③：合并前逐段体检（媒体帧数）。零媒体帧的分段跳过、不否决整场；有坏段或全部
+	// 零帧则整场失败——两条失败路径都**保留原分段与旧产物**（旧产物在 path 上，只有最终
+	// rename 成功才会被替换）。
+	plan, planErr := planLiveMerge(segFiles)
+	if len(plan.Skipped) > 0 {
+		util.LogWarn("跳过 %d 个零媒体帧的分段（断流重连的空段）：%d 个分段里保留 %d 个参与合成",
+			len(plan.Skipped), len(segFiles), len(plan.Kept))
+	}
+	if planErr != nil {
+		keepSegments = true
+		return LiveConcatFailedWithSegmentsSaved, planErr
+	}
+	segFiles = plan.Kept
+
 	if len(segFiles) == 1 {
+		// 单段也要先裁掉截断尾巴（t72 ①），再改名：坏段绝不覆盖旧产物。
+		if dropped, err := trimFLVTail(segFiles[0]); err == nil && dropped > 0 {
+			util.LogDebug("分段 %s 丢弃了 %d 字节不完整标签", segFiles[0], dropped)
+		}
 		if err := os.Rename(segFiles[0], path); err != nil {
 			return stateFor(total), err
 		}
@@ -360,6 +389,13 @@ func DownloadToFile(ctx context.Context, roomID, path string, client *util.HTTPC
 		_ = os.Remove(stagingPath)
 		keepSegments = true
 		return LiveConcatFailedWithSegmentsSaved, fmt.Errorf("直播分段合成产物异常（产物 %d 字节，源 %d 字节），分段已保留在 %s", outBytes, inputBytes, sessionDir)
+	}
+	// t72 ②：大小只是粗判据，再核对**媒体帧数**（concat -c copy 应当帧数守恒）。帧数掉了
+	// 说明合并中途丢了段/内容，同样按失败处理并保留原分段与旧产物。
+	if err := validateMergeProduct(stagingPath, plan); err != nil {
+		_ = os.Remove(stagingPath)
+		keepSegments = true
+		return LiveConcatFailedWithSegmentsSaved, fmt.Errorf("%w，分段已保留在 %s", err, sessionDir)
 	}
 	if err := os.Rename(stagingPath, path); err != nil {
 		_ = os.Remove(stagingPath)

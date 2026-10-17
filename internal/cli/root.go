@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/QC3284/BBDown-Go/internal/config"
+	"github.com/QC3284/BBDown-Go/internal/entity"
+	"github.com/QC3284/BBDown-Go/internal/fetcher"
 	"github.com/QC3284/BBDown-Go/internal/util"
 	"github.com/QC3284/BBDown-Go/internal/workflow"
 	"github.com/spf13/cobra"
@@ -90,24 +92,33 @@ var (
 	optDownloadComments   bool
 	optNotifyWebhook      string
 	optSkipAi             bool
-	optVideoAscending     bool
-	optAudioAscending     bool
-	optAllowPcdn          bool
-	optFilePattern        string
-	optMultiFilePattern   string
-	optSelectPage         string
-	optLanguage           string
-	optAria2cArgs         string
-	optUposHost           string
-	optForceReplaceHost   bool
-	optSaveArchives       bool
-	optDelayPerPage       int
-	optMuxerTimeout       int
-	optRetryCount         int
-	optRetryDelay         int
-	optURLsFile           string
-	optThreadSegmentSize  int
-	optProgressJSON       bool
+	// 字幕筛选（t78，吸收 BBDownT SubtitleSelection）：--subtitle-language 语言筛选 +
+	// --ai-subtitle-policy AI 字幕策略（显式给出时优先于 --skip-ai）。
+	optSubtitleLanguage string
+	optAISubtitlePolicy string
+	optAudioLanguage    string
+	optVideoAscending   bool
+	optAudioAscending   bool
+	optAllowPcdn        bool
+	optFilePattern      string
+	optMultiFilePattern string
+	optSelectPage       string
+	optLanguage         string
+	optAria2cArgs       string
+	optUposHost         string
+	optForceReplaceHost bool
+	optSaveArchives     bool
+	optDelayPerPage     int
+	optMuxerTimeout     int
+	optRetryCount       int
+	optRetryDelay       int
+	optURLsFile         string
+	// 批量下载三件（t80，吸收 BBDownT）：视频之间的间隔 + 空间全量清单下载。
+	// --save-archives-to-file 早已存在（optSaveArchives，见 buildMyOption），这里不重复声明。
+	optDelayPerVideo     int
+	optDownloadAll       bool
+	optThreadSegmentSize int
+	optProgressJSON      bool
 
 	// Serve options
 	optServeListen        string
@@ -129,6 +140,10 @@ var (
 	// 「整页都已下载就停止翻页」的提前结束。
 	optSubCheckPerSubDir bool
 	optSubCheckFullScan  bool
+	// 订阅节流（t71，吸收上游 1.7.7）：sub check 此前完全没有节流，首检大 UP 会把所有新增
+	// 稿件连续下载，把账号推进风控窗口（412/-352/v_voucher）。--delay-per-item 让每个工作单元
+	// 之间停顿 N 秒，把压力摊开。
+	optSubCheckDelayPerItem int
 )
 
 // rootCmd represents the base command.
@@ -154,7 +169,7 @@ var rootCmd = &cobra.Command{
   BBDown login                            扫码登录（高清与字幕需要）
 
 完整选项见 BBDown --help；与上游的行为差异见仓库 docs/UPSTREAM_ALIGNMENT.md。`,
-	Version: "3.0.1",
+	Version: "3.1.0",
 	Args:    cobra.ArbitraryArgs,
 	RunE:    runDownload,
 
@@ -653,6 +668,9 @@ func init() {
 	rootCmd.Flags().BoolVar(&optDownloadComments, "comments", false, "下载评论区")
 	rootCmd.Flags().StringVar(&optNotifyWebhook, "notify-webhook", "", "下载完成通知URL")
 	rootCmd.Flags().BoolVar(&optSkipAi, "skip-ai", false, "跳过AI字幕（默认下载AI字幕，与 BBDownT 默认一致）")
+	rootCmd.Flags().StringVar(&optSubtitleLanguage, "subtitle-language", "", "只下载这些语言的字幕(逗号分隔；短标签按语言族匹配，如 zh 含 ai-zh/zh-Hans；带连字符则精确匹配)")
+	rootCmd.Flags().StringVar(&optAISubtitlePolicy, "ai-subtitle-policy", "", "AI字幕策略: exclude(过滤AI) / include(全留) / prefer-human(同族有人工时弃AI) / only(只留AI)；显式给定时优先于 --skip-ai")
+	rootCmd.Flags().StringVar(&optAudioLanguage, "audio-language", "", "选择配音语言(代码见 -I 列出的可选配音语言，如 chi/jpn)；仅默认 WEB 解析模式，选中后产物名附加 .audio-<代码>")
 	rootCmd.Flags().BoolVar(&optVideoAscending, "video-ascending", false, "视频升序")
 	rootCmd.Flags().BoolVar(&optAudioAscending, "audio-ascending", false, "音频升序")
 	rootCmd.Flags().BoolVar(&optAllowPcdn, "allow-pcdn", false, "不替换PCDN域名")
@@ -670,6 +688,9 @@ func init() {
 	rootCmd.Flags().IntVar(&optRetryDelay, "retry-delay", 3000, "重试间隔(毫秒)")
 	rootCmd.Flags().IntVar(&optThreadSegmentSize, "thread-segment-size", 0, "分片大小(MB)，0=自动（约按并发数份）")
 	rootCmd.Flags().StringVar(&optURLsFile, "urls-file", "", "从文件批量读取下载目标（每行一个，# 注释；- 表示 stdin）")
+
+	rootCmd.Flags().IntVar(&optDelayPerVideo, "delay-per-video", defaultDelayPerVideo, "批量下载时视频之间的间隔秒数(0-600；默认 10，0=不等待)")
+	rootCmd.Flags().BoolVar(&optDownloadAll, "download-all", false, "把空间/UP 主目标展开为全部投稿逐条下载，并导出 TXT 清单（可用 --urls-file 复用）")
 	rootCmd.Flags().BoolVar(&optProgressJSON, "progress-json", false, "进度输出为逐行 JSON 事件到 stderr（供 GUI/自动化集成；默认仍是终端进度条）")
 
 	// Serve flags
@@ -700,6 +721,14 @@ func init() {
 	// 不开 --full-scan 时 mid: 订阅默认走增量扫描（空间列举只取 aid，且整页都已下载就停止翻页）。
 	subCheckCmd.Flags().BoolVar(&optSubCheckPerSubDir, "per-sub-dir", false, "每条订阅各自下到 <work-dir>/<订阅名>/ 子目录（默认关闭：全部平铺在 work-dir）")
 	subCheckCmd.Flags().BoolVar(&optSubCheckFullScan, "full-scan", false, "mid: 订阅翻完所有页（默认增量扫描：整页都已下载就停止翻页，首次部署/历史重建/怀疑漏下时用）")
+	// 订阅节流（t71）：默认 0 = 不节流，行为与改前逐字一致。
+	subCheckCmd.Flags().IntVar(&optSubCheckDelayPerItem, "delay-per-item", 0, "每个工作单元(开始检查一个订阅/下载一个新增内容)前停顿的秒数(0-600；默认 0=不节流)")
+	// 校验挂在 cobra 的 PreRunE 上（subCheckCmd 的 RunE 在 commands.go，本任务 inScope 之外）：
+	// 越界值必须在**发任何网络请求之前**报错退出 1。
+	subCheckCmd.PreRunE = func(_ *cobra.Command, _ []string) error {
+		_, err := parseDelayPerItem(optSubCheckDelayPerItem)
+		return err
+	}
 	doctorCmd.Flags().Bool("json", false, "以 JSON 输出自检结果（便于脚本/监控）")
 
 	// watchlater / sub check inherit the download option semantics (upstream).
@@ -730,6 +759,20 @@ func init() {
 }
 
 func runDownload(cmd *cobra.Command, args []string) error {
+	// t78：字幕筛选的两个开关在**发任何请求之前**校验（非法语言/策略当场报错，退出码非 0），
+	// 校验通过后写进 util 的选择状态，由 GetSubtitles 统一应用（三个解析路径同一层筛选）。
+	subLangs, err := util.ParseSubtitleLanguages(optSubtitleLanguage)
+	if err != nil {
+		return err
+	}
+	aiPolicy, err := util.ParseAISubtitlePolicy(optAISubtitlePolicy)
+	if err != nil {
+		return err
+	}
+	util.SetSubtitleSelection(subLangs, aiPolicy)
+	// t88 ⑤：本次运行结束时恢复选择状态（单命令进程，防御性复位，避免跨命令复用状态）。
+	defer util.SetSubtitleSelection(nil, util.AISubtitleUnset)
+
 	// 机读模式（--info-json）：日志让位到 stderr，stdout 只留 JSON 数据；RunE 返回时还原。
 	restoreLogs := yieldLogsToStderr(optInfoJSON)
 	defer restoreLogs()
@@ -751,14 +794,55 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	// Build MyOption from flags
 	cfg := buildMyOption()
 
+	// t80：--delay-per-video 同样在发任何请求之前校验（0-600；默认 10 = BBDownT 口径）。
+	if d, err := parseDelayPerVideo(optDelayPerVideo); err != nil {
+		return err
+	} else {
+		batchDelayPerVideo = d
+	}
+
+	// t79：--audio-language 的形态与模式互斥在**任何网络请求之前**判定（与上面字幕两个开关同一纪律；
+	// workflow.Run 里还有一次同样的校验，供 serve 等其它入口复用）。
+	if err := workflow.ValidateAudioLanguageOptions(optAudioLanguage, cfg); err != nil {
+		return err
+	}
+
 	// APP 接口不识别 WEB 登录 Cookie：登录用户加 -a 看不到高清时给出提示。
 	warnAppAPIWithoutToken(cfg.UseAppAPI, cfg.AccessToken)
+
+	// t80：--download-all 在批量循环之前把空间/UP 主目标展开成逐个投稿（并在 work-dir 写 TXT 清单，
+	// 可直接回喂 --urls-file）。展开失败要明确报错，不能静默少下。
+	if optDownloadAll {
+		client := buildHTTPClient(cfg)
+		spacePageLister = func(lctx context.Context, mid string) ([]entity.Page, error) {
+			// 与 sub check 同一条路径：一次 InitSession 拿 wbi，然后全量扫描该 UP 主的投稿。
+			wbi, err := workflow.InitSession(lctx, &cfg, client)
+			if err != nil {
+				return nil, err
+			}
+			space := fetcher.NewSpaceVideoFetcher(client, wbi, cfg.Cookie, fetcher.SpaceScanOptions{FullScan: true})
+			info, err := space.Fetch(lctx, "mid:"+mid)
+			if err != nil {
+				return nil, err
+			}
+			return info.PagesInfo, nil
+		}
+		expanded, err := buildDownloadAllTargets(cmd.Context(), targets, spacePageLister, spaceListPathFor(targets, cfg.WorkDir))
+		if err != nil {
+			return err
+		}
+		targets = expanded
+		if len(targets) == 0 {
+			return fmt.Errorf("--download-all 没有展开出任何投稿")
+		}
+		optURL = targets[0]
+	}
 
 	// Run the workflow
 	client := buildHTTPClient(cfg)
 
 	// Fire-and-forget update check (upstream DefaultCommand)：批量也只查一次。
-	updateCheck(context.Background(), client, "v3.0.1")
+	updateCheck(context.Background(), client, "v3.1.0")
 
 	// 中断 ctx 来自 Execute 的统一安装（见 interrupt.go）：runDownload 与 resume 走同一条
 	// downloadTargets，不会出现两套取消语义。
@@ -865,6 +949,7 @@ func downloadTargets(ctx context.Context, cmd *cobra.Command, cfg config.MyOptio
 		one := cfg
 		one.URL = target
 		wf := workflow.New(one, client)
+		wf.SetAudioLanguage(optAudioLanguage) // t79：配音语言选择（校验在 workflow.Run 开头统一做）
 		// 收尾汇总的平均速率要的是**落盘字节**：OnSaved 是产物落盘的唯一出口（与 serve 同一钩子），
 		// 这里顺手累计一次；拿不到大小（stat 失败）就不计，宁可少报也不虚报。
 		// 按路径去重（与 serve 的 onArtifactSaved 同一语义）：分片重试/断点续传会重复调用 OnSaved，
