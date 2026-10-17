@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -202,7 +203,9 @@ func TestSelfUpdateDownloadsVerifiesAndReplaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o100 == 0 {
+	// 可执行位只在 POSIX 语义下有（Windows 上 Go 报告 -rw-rw-rw-，无 exec bit 概念）；
+	// 跨平台判据：只检查内容与「替换后仍是常规文件」，exec bit 留给 POSIX 平台断言。
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o100 == 0 {
 		t.Errorf("替换后丢了可执行位：%v", info.Mode())
 	}
 	assertNoTempLeftovers(t, dir)
