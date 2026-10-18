@@ -1119,6 +1119,13 @@ SubtitleItem{lan=3,lanDoc=4,subtitleUrl=5}）。只手解三个字段（手写 v
 - --audio-language：APP(gRPC)/INTL 未接 cur_language 重请求（响应侧 confirm 仍核对、不一致即报错不静默下错；双模式支持记候选）；
 - self-update 用 GitHub 资产 digest 而非独立 checksums 文件（缺摘要即拒更新）。
 
+### 4.74 第六十九轮：仅音频产物按原生格式输出（用户定 2026-10-17）
+
+- **FLAC 轨输出原生 .flac 容器**（此前与 BBDownT/上游一致包成 .m4a——FLAC-in-M4A 是部分播放器（溏心音乐/鸿蒙）读不到封面的根源）：仅音频时按音轨原生编码落容器——FLAC→.flac（ffmpeg -f flac，封面 attached_pic 保留），AAC/E-AC-3→.m4a 不变；输出里加一行提示「音频为 FLAC 无损格式，按原生格式输出为 <文件名>」。
+- **配套**：混流临时文件与最终产物同扩展名（否则 -f 按扩展名定容器会出错）；FLAC 容器不携带字幕轨（装不下 mov_text），字幕仍落侧车 .srt；--audio-language 的后缀注入不再强制 .m4a（扩展名在上游已落定）。
+- 属**用户可见行为变更**（有意偏离 BBDownT 的 .m4a 口径），按用户指令实施。
+
+
 **已免疫（登记备查）**：TV playurl 的字符串 result（Go 类型断言天然放行，上游 1.7.6 同病我们未病）；替换 host 404 回退（§4.33 早于上游）；多线程续传布局校验（本仓无多线程续传，不同病——若将来补续传必须同时做布局校验）；服务器透传文本净化（logger/file 层已有 Sanitize）；DRM 唯一临时文件（t45 已是 .dec+rename 语义）。
 
 

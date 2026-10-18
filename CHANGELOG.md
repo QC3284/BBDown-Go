@@ -10,6 +10,20 @@
 [docs/UPSTREAM_ALIGNMENT.md](docs/UPSTREAM_ALIGNMENT.md) 的差异表逐条登记，
 候选清单与优先级见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## [3.1.1] - 2026-10-18
+
+**修复批次**（行为变更：仅音频产物按原生格式输出，用户定）。
+
+### 变更
+
+- **FLAC 无损音轨输出原生 `.flac`**（不再包 `.m4a` 层）：文件原本是什么格式就以原本的格式/后缀输出——FLAC→`.flac`（封面 attached_pic 保留、字幕走侧车 .srt），AAC/E-AC-3 等维持 `.m4a`；下载输出里新增一行提示「音频为 FLAC 无损格式，按原生格式输出为 <文件名>」。
+- 配套：混流临时文件与最终产物同扩展名；FLAC 容器不携带 mov_text 字幕轨。
+
+### 说明
+
+- 属有意偏离 BBDownT/上游的 `.m4a` 口径（FLAC-in-M4A 是部分播放器读不到封面的根源），登记 [§4.74](docs/UPSTREAM_ALIGNMENT.md)。
+- 版本位：行为变更修复批次 → **patch**（3.1.0 → 3.1.1）。
+
 ## [3.1.0] - 2026-10-17
 
 **功能周期**（上游同步大批次：AliverAnme 1.7.4~1.7.7 + BBDownT 2.1.7 功能件，吸收与偏离逐条见 [§4.73](docs/UPSTREAM_ALIGNMENT.md)）。

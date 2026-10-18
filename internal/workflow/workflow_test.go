@@ -438,3 +438,24 @@ func TestFindBinariesNoWarnWhenPathExists(t *testing.T) {
 		t.Errorf("显式路径应当被采用：FFMPEG=%q MP4BOX=%q", muxer.FFMPEG, muxer.MP4BOX)
 	}
 }
+
+// TestAudioOutputExt 钉住「原生格式输出」口径（用户定 2026-10-17）：
+// FLAC 轨 → .flac + nativeFlac（要打提醒）；AAC/E-AC-3 等 → .m4a。
+func TestAudioOutputExt(t *testing.T) {
+	cases := []struct {
+		codecs string
+		ext    string
+		flac   bool
+	}{
+		{"fLaC", ".flac", true},
+		{"flac", ".flac", true},
+		{"mp4a.40.2", ".m4a", false},
+		{"ec-3", ".m4a", false},
+	}
+	for _, c := range cases {
+		ext, nativeFlac := audioOutputExt(&entity.Audio{Codecs: c.codecs})
+		if ext != c.ext || nativeFlac != c.flac {
+			t.Errorf("codecs=%q → (%q,%v), want (%q,%v)", c.codecs, ext, nativeFlac, c.ext, c.flac)
+		}
+	}
+}

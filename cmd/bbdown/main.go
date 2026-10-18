@@ -12,7 +12,7 @@ import (
 //
 // 打不打由 cli.Execute 决定：机读模式（--info-json / doctor --json）下不打，stdout 只留数据。
 // 判定必须放在 Execute 里——它要看合并 BBDown.config 之后的参数，main 这里只看得到命令行。
-var banner = util.AnsiBgDarkBlue + util.AnsiWhite + "BBDown version 3.1.0, Bilibili Downloader." + util.AnsiReset + "\r\n" +
+var banner = util.AnsiBgDarkBlue + util.AnsiWhite + "BBDown version 3.1.1, Bilibili Downloader." + util.AnsiReset + "\r\n" +
 	"遇到问题请首先到以下地址查阅有无相关信息：\r\n" +
 	"https://github.com/QC3284/BBDown-Go/issues\r\n" +
 	"\n"

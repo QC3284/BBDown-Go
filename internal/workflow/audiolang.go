@@ -201,7 +201,9 @@ func WithAudioLanguageSuffix(path, code string) string {
 func AudioLanguageOutputPath(path, code string, audioOnly, videoOnly bool) string {
 	out := WithAudioLanguageSuffix(path, code)
 	if audioOnly {
-		return changeExtension(out, ".m4a")
+		// 2026-10-17 起仅音频产物按音轨原生格式输出（FLAC → .flac）：扩展名在上游
+		// savePath 阶段已落定，这里不再强制 .m4a（否则会把 .flac 改回去）。
+		return out
 	}
 	if videoOnly {
 		ext := filepath.Ext(out)

@@ -356,3 +356,75 @@ func TestMp4boxEscapesCoverPath(t *testing.T) {
 		t.Errorf("the cover path was not escaped in -itags:\n%s", raw)
 	}
 }
+
+// TestMuxAudioOnlyFlacUsesNativeContainer 钉住「原生格式输出」的混流侧（用户定 2026-10-17）：
+// 仅音频 + 输出 .flac → ffmpeg 走 -f flac、绝不带 movflags/faststart；
+// 仅音频 + 输出 .m4a → 仍走 -f mp4（既有行为）。
+func TestMuxAudioOnlyFlacUsesNativeContainer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg is a POSIX shell script")
+	}
+
+	for _, tc := range []struct {
+		name       string
+		out        string
+		wantFormat string
+		wantMov    bool
+	}{
+		{"FLAC 原生容器", "out.flac", "flac", false},
+		{"M4A 保持 mp4 容器", "out.m4a", "mp4", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			argsFile := filepath.Join(dir, "args.txt")
+			script := filepath.Join(dir, "fake-ffmpeg")
+			body := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsFile + "'\nexit 0\n"
+			if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			origFFmpeg := FFMPEG
+			FFMPEG = script
+			defer func() { FFMPEG = origFFmpeg }()
+
+			outPath := filepath.Join(dir, tc.out)
+			// FLAC 容器装不下 mov_text 字幕轨（2026-10-17）：传一个字幕进用例，
+			// 断言 flac 分支把它跳过（argv 里不得出现 .srt 输入与 -c:s）。
+			sub := filepath.Join(dir, "zh.srt")
+			if err := os.WriteFile(sub, []byte("1\n00:00:00,000 --> 00:00:01,000\nhi\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := MuxAV(context.Background(), false, "BV1", "", filepath.Join(dir, "a.m4a"), outPath,
+				"desc", "title", "author", "ep1", "", "", []entity.Subtitle{{Lan: "zh-CN", Path: sub}}, true, false, false, nil, 0, false, nil, 5)
+			if err != nil {
+				t.Fatalf("MuxAV returned error: %v", err)
+			}
+			raw, _ := os.ReadFile(argsFile)
+			args := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+			hasF := false
+			hasMov := false
+			for i, a := range args {
+				if a == "-f" && i+1 < len(args) {
+					if args[i+1] == tc.wantFormat {
+						hasF = true
+					}
+				}
+				if a == "-movflags" {
+					hasMov = true
+				}
+			}
+			if !hasF {
+				t.Errorf("缺少 -f %s：%q", tc.wantFormat, args)
+			}
+			if hasMov != tc.wantMov {
+				t.Errorf("-movflags 出现=%v，want %v：%q", hasMov, tc.wantMov, args)
+			}
+			if tc.wantFormat == "flac" {
+				for _, a := range args {
+					if strings.HasSuffix(a, ".srt") || a == "-c:s" {
+						t.Errorf("FLAC 容器不得携带字幕轨，argv 出现 %q：%q", a, args)
+					}
+				}
+			}
+		})
+	}
+}

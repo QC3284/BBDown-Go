@@ -188,7 +188,9 @@ func TestAudioLanguageOutputPath(t *testing.T) {
 		{"默认语言不加后缀", filepath.Join("videos", "video.mp4"), "", false, false, filepath.Join("videos", "video.mp4")},
 		{"代码小写化", filepath.Join("videos", "video.mp4"), " EN-us ", false, false, filepath.Join("videos", "video.audio-en-us.mp4")},
 		{"中文原声", "video.mp4", "zh-CN", false, false, "video.audio-zh-cn.mp4"},
-		{"仅音频落定 m4a", "video.mp4", "en-US", true, false, "video.audio-en-us.m4a"},
+		// 2026-10-17 起仅音频按原生格式输出：扩展名在上游已落定（FLAC→.flac），这里只插语言后缀。
+		{"仅音频保留已有扩展名", "video.m4a", "en-US", true, false, "video.audio-en-us.m4a"},
+		{"仅音频 FLAC 原生扩展名", "video.flac", "en-US", true, false, "video.audio-en-us.flac"},
 		{"仅视频加 .video 标记", "video.mp4", "en-US", false, true, "video.audio-en-us.video.mp4"},
 		{"多段名只替换最后扩展名", "a.b.mp4", "jpn", false, false, "a.b.audio-jpn.mp4"},
 		{"无扩展名", "video", "jpn", false, false, "video.audio-jpn"},

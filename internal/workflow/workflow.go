@@ -661,8 +661,16 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 		if !strings.HasSuffix(strings.ToLower(savePath), ".mp4") && !w.Cfg.AudioOnly {
 			savePath += ".mp4"
 		}
-		if w.Cfg.AudioOnly && !strings.HasSuffix(strings.ToLower(savePath), ".m4a") {
-			savePath += ".m4a"
+		if w.Cfg.AudioOnly {
+			ext, nativeFlac := audioOutputExt(selectedAudio)
+			if !strings.HasSuffix(strings.ToLower(savePath), ext) {
+				savePath += ext
+			}
+			if nativeFlac {
+				// 用户定（2026-10-17）：FLAC 无损音轨按**原生格式**输出（.flac 容器），
+				// 不再包一层 .m4a——部分播放器（如溏心音乐）读不了 FLAC-in-M4A 的封面/元数据。
+				util.Log("提示：音频为 FLAC 无损格式，按原生格式输出为 %s", filepath.Base(savePath))
+			}
 		}
 		// t79：语言后缀的唯一注入点（页面产物）。配音轨/背景音轨不经过这里，见 pageArtifactPath。
 		savePath = w.pageArtifactPath(savePath)
@@ -1102,7 +1110,10 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 			// mux was interrupted or failed, and the "已存在, 跳过下载" check above
 			// then treated that half-file as a finished download forever (upstream
 			// muxes to savePath + ".muxing-{guid}.mp4" and renames).
-			muxPath := fmt.Sprintf("%s.muxing-%d.mp4", savePath, time.Now().UnixNano())
+			// 混流临时文件与最终产物同扩展名：-f 由扩展名决定容器，.flac 产物若用 .mp4 临时名会带着 MP4 容器
+			//（2026-10-17 原生格式输出：FLAC → .flac 需要 muxPath 也以 .flac 结尾）。
+			muxExt := filepath.Ext(savePath)
+			muxPath := fmt.Sprintf("%s.muxing-%d%s", strings.TrimSuffix(savePath, muxExt), time.Now().UnixNano(), muxExt)
 			muxErr := muxer.MuxAV(ctx, w.Cfg.UseMP4box, page.Bvid(), videoPath, audioPath, muxPath,
 				desc, title, page.OwnerName, episodeTitle, coverPath, lang,
 				downloadedSubs, w.Cfg.AudioOnly, w.Cfg.VideoOnly, w.Cfg.SimplyMux,
@@ -2412,4 +2423,15 @@ func filterAiSubs(subs []entity.Subtitle, skipAi bool, policy util.AISubtitlePol
 		}
 	}
 	return filtered
+}
+
+// audioOutputExt 决定仅音频产物的容器扩展名（用户定 2026-10-17：文件原本是什么格式，
+// 就以原本的格式/后缀输出——FLAC 轨输出原生 .flac，其余（AAC/E-AC-3 等）维持 .m4a）。
+// 返回 nativeFlac=true 时调用方补一条输出提醒。
+// 变异验证：把 flac 分支改回恒 .m4a → TestAudioOutputExt 红。
+func audioOutputExt(a *entity.Audio) (string, bool) {
+	if a != nil && strings.Contains(strings.ToLower(a.Codecs), "flac") {
+		return ".flac", true
+	}
+	return ".m4a", false
 }

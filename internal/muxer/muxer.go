@@ -54,6 +54,11 @@ func escapeString(s string) string {
 }
 
 func muxByFFmpeg(ctx context.Context, url, videoPath, audioPath, outPath, desc, title, author, episodeID, pic, lang string, subs []entity.Subtitle, audioOnly, videoOnly, simplyMux bool, points []entity.ViewPoint, pubTime int64, isHevc bool, audioMaterial []entity.AudioMaterial, timeoutMinutes int) error {
+	// FLAC 原生容器（2026-10-17）：FLAC 装不下 mov_text 字幕轨，字幕走侧车 .srt 文件（下载阶段已落盘）。
+	nativeFlac := audioOnly && strings.EqualFold(filepath.Ext(outPath), ".flac")
+	if nativeFlac {
+		subs = nil
+	}
 	dir := filepath.Dir(outPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -189,7 +194,13 @@ func muxByFFmpeg(ctx context.Context, url, videoPath, audioPath, outPath, desc, 
 	if runtime.GOOS == "darwin" && isHevc {
 		args = append(args, "-tag:v:0", "hvc1")
 	}
-	args = append(args, "-movflags", "faststart", "-strict", "unofficial", "-strict", "-2", "-f", "mp4", "--", outPath)
+	// 仅音频 + FLAC 原生容器（用户定 2026-10-17：文件原本什么格式就输出什么格式）：
+	// movflags/faststart 与 -f mp4 都是 MP4 专属，FLAC 容器必须走 -f flac。
+	if audioOnly && strings.EqualFold(filepath.Ext(outPath), ".flac") {
+		args = append(args, "-f", "flac", "--", outPath)
+	} else {
+		args = append(args, "-movflags", "faststart", "-strict", "unofficial", "-strict", "-2", "-f", "mp4", "--", outPath)
+	}
 
 	util.LogDebug("ffmpeg: %s %s", FFMPEG, strings.Join(args, " "))
 	cmd := exec.CommandContext(ctx, FFMPEG, args...)
