@@ -157,9 +157,9 @@
 - 完成：仅音频默认按原生格式输出（FLAC 轨 → .flac 含封面；AAC/E-AC-3 → .m4a 不变）+ `--audio-format` 参数（m4a 强制 MP4 包装 / flac 仅 FLAC 轨合法 / 非法值发起网络前拒绝 / 大小写不敏感）；登记 §4.74。
 - 遗留：`--audio-format` 仅注册在主下载命令（watchlater/sub-check 未注册该旗标，与 `--audio-language` 现状一致；两路径亦无 `--audio-only`，无用户影响，后续一并处理）。
 - 新增候选（2026-11-01 上游对照：v1.7.4–v1.7.8 + BBDownT 2.2.0 + API-collect 弃用）：
-  1. serve 加固包：webhook URL 日志脱敏 + 回调不走系统代理 + 任务 JSON/serve 日志 0600（上游 #113/#114，约 0.5–1 人日）；
-  2. 测试补强：TV 番剧字符串 result 矩阵 + 空订阅非法 delay（约 2h）；
-  3. 残留清理：硬杀后 `<base>.muxing-*` 清扫（约 1h）；
+  1. serve 加固包：webhook URL 日志脱敏 + 回调不走系统代理 + 任务 JSON/serve 日志 0600（上游 #113/#114，约 0.5–1 人日）✅ 已完成（3.1.2）；
+  2. 测试补强：TV 番剧字符串 result 矩阵 + 空订阅非法 delay（约 2h）✅ 已完成（3.1.2）；
+  3. 残留清理：硬杀后 `<base>.muxing-*` 清扫（约 1h）✅ 已完成（3.1.2）；
   4. 多线程续传 + 分片布局校验（上游 1.7.4 确认价值，2~3 人日）；
   5. BBDownT 2.2.0 课程/国际站修复复核（本地源码已 clone 至 /tmp/BBDownT-inspect）；
   6. `--work-dir` 默认落点（程序目录 Download vs 当前目录）——**待用户拍板**。

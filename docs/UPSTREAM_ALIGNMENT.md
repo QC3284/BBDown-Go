@@ -1129,6 +1129,14 @@ SubtitleItem{lan=3,lanDoc=4,subtitleUrl=5}）。只手解三个字段（手写 v
 
 **已免疫（登记备查）**：TV playurl 的字符串 result（Go 类型断言天然放行，上游 1.7.6 同病我们未病）；替换 host 404 回退（§4.33 早于上游）；多线程续传布局校验（本仓无多线程续传，不同病——若将来补续传必须同时做布局校验）；服务器透传文本净化（logger/file 层已有 Sanitize）；DRM 唯一临时文件（t45 已是 .dec+rename 语义）。
 
+### 4.75 第七十轮：serve 安全加固 + 残留清扫（上游 1.7.4~1.7.8 与未发布 #113/#114 跟进）
+
+- **回调/webhook 日志脱敏**（上游未发布 #114）：日志只保留 scheme://host:port（webhookLogTarget），userinfo/path/query 丢弃；回调失败只记异常类型与脱敏目标（callbackFailureLog 只记 %T）。**有意取舍**：失败日志不再含完整错误 URL/原因，换 webhook token 不落日志。
+- **回调不走系统代理**（上游 #114 同款）：newCallbackTransport 置 Proxy: nil，直连已校验 IP。
+- **serve 落盘权限**（上游未发布 #113）：任务 JSON 与 serve 日志在 Unix 上创建即 0600（SecureFileMode / TightenFilePermissions / TightenOpenFilePermissions），启动时收紧既有 0644 文件；Windows 权限语义不同，runtime.GOOS 守卫 + t.Skipf 说明原因。
+- **混流残留清扫**（上游 1.7.5 同族）：CleanupProductResidues 只清 <base>.muxing-<数字><后缀>（生产命名 %s.muxing-%d%s），非数字后缀/其它产物/.tmp 不误伤；skip 分支重构为 handleExistingProduct。
+- **测试补强**：TV 番剧非对象 result 六夹具（string "suee"/null/number/array/missing + 非对象根 []）钉住 Go 断言对 1.7.6 同病的免疫（§4.74 已免疫项补回放矩阵）；空订阅 --delay-per-item 越界在 PreRunE 拒绝（1.7.8 同病）。
+
 
 
 
