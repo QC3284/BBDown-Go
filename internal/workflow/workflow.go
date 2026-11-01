@@ -49,6 +49,9 @@ type Workflow struct {
 	// 只有它非空时 pageArtifactPath 才加 .audio-<code> 后缀。见 audiolang.go。
 	audioLanguage          string
 	audioLanguageConfirmed string
+	// audioFormat 是 --audio-format 的取值（""=按音轨原生格式 / "m4a" / "flac"，2026-10-18 用户定）；
+	// 取值校验在 Run 开头做（validateAudioFormat），容器/提示由 audioOutputExt 决定。
+	audioFormat string
 
 	// MetaHandler is invoked with the fetched video metadata (serve mode uses
 	// it to fill task Title/Pic/VideoPubTime).
@@ -87,6 +90,12 @@ func (w *Workflow) SetAudioLanguage(code string) {
 	w.audioLanguage = code
 }
 
+// SetAudioFormat 设置 --audio-format（""=按音轨原生格式 / "m4a" / "flac"）。校验同样在
+// Run 开头一次性做（validateAudioFormat）。
+func (w *Workflow) SetAudioFormat(f string) {
+	w.audioFormat = f
+}
+
 // InitSession prepares a session for non-download commands (watchlater / sub
 // check): loads credentials, checks the login state, extracts the WBI key and
 // returns it (upstream InitializeRequestSessionAsync).
@@ -116,6 +125,12 @@ func (w *Workflow) Run(ctx context.Context) error {
 	input := w.Cfg.URL
 	if input == "" {
 		return fmt.Errorf("请提供视频地址")
+	}
+
+	// --audio-format 只有 ""/m4a/flac 三个合法取值；纯参数校验，必须在**任何网络请求之前**做
+	// （放在 ResolveURL 之前：非法值不再先打一次链接解析请求）。
+	if err := validateAudioFormat(w.audioFormat); err != nil {
+		return err
 	}
 
 	// Resolve aid from URL
@@ -662,14 +677,17 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 			savePath += ".mp4"
 		}
 		if w.Cfg.AudioOnly {
-			ext, nativeFlac := audioOutputExt(selectedAudio)
+			ext, hint, err := audioOutputExt(selectedAudio, w.audioFormat)
+			if err != nil {
+				util.LogError("--audio-format 错误：%v", err)
+				return false
+			}
 			if !strings.HasSuffix(strings.ToLower(savePath), ext) {
 				savePath += ext
 			}
-			if nativeFlac {
-				// 用户定（2026-10-17）：FLAC 无损音轨按**原生格式**输出（.flac 容器），
-				// 不再包一层 .m4a——部分播放器（如溏心音乐）读不了 FLAC-in-M4A 的封面/元数据。
-				util.Log("提示：音频为 FLAC 无损格式，按原生格式输出为 %s", filepath.Base(savePath))
+			// 提示文案统一带一个 %s（产物文件名占位符）；默认 FLAC 那一行与 3.1.1 已发布输出逐字一致。
+			if hint != "" {
+				util.Log(hint, filepath.Base(savePath))
 			}
 		}
 		// t79：语言后缀的唯一注入点（页面产物）。配音轨/背景音轨不经过这里，见 pageArtifactPath。
@@ -2425,13 +2443,50 @@ func filterAiSubs(subs []entity.Subtitle, skipAi bool, policy util.AISubtitlePol
 	return filtered
 }
 
-// audioOutputExt 决定仅音频产物的容器扩展名（用户定 2026-10-17：文件原本是什么格式，
-// 就以原本的格式/后缀输出——FLAC 轨输出原生 .flac，其余（AAC/E-AC-3 等）维持 .m4a）。
-// 返回 nativeFlac=true 时调用方补一条输出提醒。
-// 变异验证：把 flac 分支改回恒 .m4a → TestAudioOutputExt 红。
-func audioOutputExt(a *entity.Audio) (string, bool) {
-	if a != nil && strings.Contains(strings.ToLower(a.Codecs), "flac") {
-		return ".flac", true
+// normalizeAudioFormat 归一化 --audio-format 的取值：大小写不敏感、容忍首尾空白。
+func normalizeAudioFormat(want string) string {
+	return strings.ToLower(strings.TrimSpace(want))
+}
+
+// validateAudioFormat 校验 --audio-format 的取值（不传 = 按音轨原生格式输出，合法）。
+// 只做纯字符串校验：不读音轨信息、不发请求，所以 Run 能在任何网络请求之前调用它。
+func validateAudioFormat(want string) error {
+	switch normalizeAudioFormat(want) {
+	case "", "m4a", "flac":
+		return nil
 	}
-	return ".m4a", false
+	return fmt.Errorf("--audio-format 只支持 m4a（强制 MP4 包装）或 flac（仅 FLAC 无损音轨），当前为 %q；不传则按音轨原生格式输出", want)
+}
+
+// audioOutputExt 决定仅音频产物的容器扩展名（用户定 2026-10-17）：
+// **默认按原生格式输出**（FLAC 轨 → 原生 .flac，其余维持 .m4a）；
+// 仍接受 --audio-format 参数覆盖：want="m4a" 强制 MP4 包装（旧行为）；want="flac" 仅对 FLAC 轨合法。
+// 第二个返回值是提示文案（空 = 不用打），文案里恰好一个 %s 留给产物文件名。
+// 变异验证：撤 want 分支 / 撤原生 flac / 撤取值校验 → TestAudioOutputExt、TestValidateAudioFormat 红。
+func audioOutputExt(a *entity.Audio, want string) (string, string, error) {
+	if err := validateAudioFormat(want); err != nil {
+		return "", "", err
+	}
+	isFlac := a != nil && strings.Contains(strings.ToLower(a.Codecs), "flac")
+	switch normalizeAudioFormat(want) {
+	case "m4a":
+		if isFlac {
+			return ".m4a", "提示：FLAC 无损音轨已按 --audio-format=m4a 强制封装为 %s（默认输出原生 .flac）", nil
+		}
+		return ".m4a", "", nil
+	case "flac":
+		if !isFlac {
+			codec := ""
+			if a != nil {
+				codec = a.Codecs
+			}
+			return "", "", fmt.Errorf("--audio-format=flac 仅适用于 FLAC 无损音轨（当前音轨为 %q）", codec)
+		}
+		return ".flac", "", nil
+	default: // ""
+		if isFlac {
+			return ".flac", "提示：音频为 FLAC 无损格式，按原生格式输出为 %s", nil
+		}
+		return ".m4a", "", nil
+	}
 }

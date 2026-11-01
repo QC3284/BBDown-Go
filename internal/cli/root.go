@@ -97,6 +97,7 @@ var (
 	optSubtitleLanguage string
 	optAISubtitlePolicy string
 	optAudioLanguage    string
+	optAudioFormat      string
 	optVideoAscending   bool
 	optAudioAscending   bool
 	optAllowPcdn        bool
@@ -671,6 +672,7 @@ func init() {
 	rootCmd.Flags().StringVar(&optSubtitleLanguage, "subtitle-language", "", "只下载这些语言的字幕(逗号分隔；短标签按语言族匹配，如 zh 含 ai-zh/zh-Hans；带连字符则精确匹配)")
 	rootCmd.Flags().StringVar(&optAISubtitlePolicy, "ai-subtitle-policy", "", "AI字幕策略: exclude(过滤AI) / include(全留) / prefer-human(同族有人工时弃AI) / only(只留AI)；显式给定时优先于 --skip-ai")
 	rootCmd.Flags().StringVar(&optAudioLanguage, "audio-language", "", "选择配音语言(代码见 -I 列出的可选配音语言，如 chi/jpn)；仅默认 WEB 解析模式，选中后产物名附加 .audio-<代码>")
+	rootCmd.Flags().StringVar(&optAudioFormat, "audio-format", "", "仅音频产物(--audio-only)的封装格式: m4a(强制MP4包装) / flac(仅FLAC无损音轨合法)；默认按音轨原生格式输出(FLAC→.flac)")
 	rootCmd.Flags().BoolVar(&optVideoAscending, "video-ascending", false, "视频升序")
 	rootCmd.Flags().BoolVar(&optAudioAscending, "audio-ascending", false, "音频升序")
 	rootCmd.Flags().BoolVar(&optAllowPcdn, "allow-pcdn", false, "不替换PCDN域名")
@@ -950,6 +952,7 @@ func downloadTargets(ctx context.Context, cmd *cobra.Command, cfg config.MyOptio
 		one.URL = target
 		wf := workflow.New(one, client)
 		wf.SetAudioLanguage(optAudioLanguage) // t79：配音语言选择（校验在 workflow.Run 开头统一做）
+		wf.SetAudioFormat(optAudioFormat)     // 3.1.1：仅音频封装格式覆盖（校验同样在 workflow.Run 开头）
 		// 收尾汇总的平均速率要的是**落盘字节**：OnSaved 是产物落盘的唯一出口（与 serve 同一钩子），
 		// 这里顺手累计一次；拿不到大小（stat 失败）就不计，宁可少报也不虚报。
 		// 按路径去重（与 serve 的 onArtifactSaved 同一语义）：分片重试/断点续传会重复调用 OnSaved，

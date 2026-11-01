@@ -375,6 +375,7 @@ func runWatchLater(cmd *cobra.Command, args []string) error {
 		opt.Wbi = watchLaterWbi
 		wf := workflow.New(opt, client)
 		wf.SetAudioLanguage(optAudioLanguage) // t79：与主下载路径同一开关
+		wf.SetAudioFormat(optAudioFormat)     // 3.1.1：仅音频封装格式（与主下载路径同一开关）
 		if err := wf.Run(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return silenceOnCancel(cmd, err)

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -439,23 +440,85 @@ func TestFindBinariesNoWarnWhenPathExists(t *testing.T) {
 	}
 }
 
-// TestAudioOutputExt 钉住「原生格式输出」口径（用户定 2026-10-17）：
-// FLAC 轨 → .flac + nativeFlac（要打提醒）；AAC/E-AC-3 等 → .m4a。
+// TestAudioOutputExt 钉住「仅音频产物」的容器与提示矩阵（用户定 2026-10-17，--audio-format 于 3.1.1 收尾）：
+// 默认按音轨原生格式输出（FLAC → .flac 并打提醒；AAC/E-AC-3 → .m4a 不提醒）；
+// --audio-format=m4a 强制 MP4 包装（FLAC 轨回到旧口径并打提醒）；
+// --audio-format=flac 仅对 FLAC 轨合法，其它音轨必须明确报错（不静默降级）；
+// 取值大小写/首尾空白归一；非法取值报错。
+// 提示文案里的 %s 由调用点填产物文件名（见 downloadOnePage），这里钉住模板原文。
 func TestAudioOutputExt(t *testing.T) {
+	flacTrack := &entity.Audio{Codecs: "fLaC"}
+	aacTrack := &entity.Audio{Codecs: "mp4a.40.2"}
+	eac3Track := &entity.Audio{Codecs: "ec-3"}
 	cases := []struct {
-		codecs string
-		ext    string
-		flac   bool
+		name     string
+		audio    *entity.Audio
+		want     string
+		wantExt  string
+		wantHint string
+		wantErr  string
 	}{
-		{"fLaC", ".flac", true},
-		{"flac", ".flac", true},
-		{"mp4a.40.2", ".m4a", false},
-		{"ec-3", ".m4a", false},
+		{"默认-FLAC轨输出原生flac并提醒", flacTrack, "", ".flac", "提示：音频为 FLAC 无损格式，按原生格式输出为 %s", ""},
+		{"默认-AAC轨维持m4a不提醒", aacTrack, "", ".m4a", "", ""},
+		{"默认-E-AC-3轨维持m4a不提醒", eac3Track, "", ".m4a", "", ""},
+		{"默认-无音轨维持m4a", nil, "", ".m4a", "", ""},
+		{"m4a-FLAC轨强制MP4包装并提醒", flacTrack, "m4a", ".m4a", "提示：FLAC 无损音轨已按 --audio-format=m4a 强制封装为 %s（默认输出原生 .flac）", ""},
+		{"m4a-AAC轨维持m4a不提醒", aacTrack, "m4a", ".m4a", "", ""},
+		{"m4a-E-AC-3轨维持m4a不提醒", eac3Track, "m4a", ".m4a", "", ""},
+		{"m4a-无音轨维持m4a", nil, "m4a", ".m4a", "", ""},
+		{"flac-FLAC轨原样输出", flacTrack, "flac", ".flac", "", ""},
+		{"flac-AAC轨明确报错", aacTrack, "flac", "", "", "仅适用于 FLAC 无损音轨"},
+		{"flac-E-AC-3轨明确报错", eac3Track, "flac", "", "", "仅适用于 FLAC 无损音轨"},
+		{"flac-无音轨明确报错", nil, "flac", "", "", "仅适用于 FLAC 无损音轨"},
+		{"取值大小写与空白归一为m4a", flacTrack, "  M4A ", ".m4a", "提示：FLAC 无损音轨已按 --audio-format=m4a 强制封装为 %s（默认输出原生 .flac）", ""},
+		{"非法取值明确报错", aacTrack, "mp3", "", "", "只支持 m4a"},
 	}
 	for _, c := range cases {
-		ext, nativeFlac := audioOutputExt(&entity.Audio{Codecs: c.codecs})
-		if ext != c.ext || nativeFlac != c.flac {
-			t.Errorf("codecs=%q → (%q,%v), want (%q,%v)", c.codecs, ext, nativeFlac, c.ext, c.flac)
+		t.Run(c.name, func(t *testing.T) {
+			ext, hint, err := audioOutputExt(c.audio, c.want)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("want=%q err = %v, want 含 %q", c.want, err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("want=%q unexpected err: %v", c.want, err)
+			}
+			if ext != c.wantExt || hint != c.wantHint {
+				t.Errorf("want=%q → (ext=%q, hint=%q), want (%q, %q)", c.want, ext, hint, c.wantExt, c.wantHint)
+			}
+		})
+	}
+}
+
+// TestValidateAudioFormat 钉住取值校验本身：只认 m4a/flac/不传（大小写与首尾空白归一），
+// 其它取值给明确错误（Run 开头据此在任何网络请求之前拒绝）。
+func TestValidateAudioFormat(t *testing.T) {
+	for _, want := range []string{"", "m4a", "flac", " FLAC ", "M4a"} {
+		if err := validateAudioFormat(want); err != nil {
+			t.Errorf("validateAudioFormat(%q) = %v, want nil", want, err)
 		}
+	}
+	for _, want := range []string{"aac", "m4a2", "flac-x", "mp3", "flac m4a"} {
+		err := validateAudioFormat(want)
+		if err == nil || !strings.Contains(err.Error(), "--audio-format 只支持") {
+			t.Errorf("validateAudioFormat(%q) err = %v, want 明确的「只支持 m4a/flac」错误", want, err)
+		}
+	}
+}
+
+// TestRunRejectsInvalidAudioFormatBeforeNetwork 钉住 Run 开头的前置校验：
+// 非法 --audio-format 必须在任何网络请求之前被拒绝（New(cfg, nil) 没有 HTTPClient——
+// 校验若被挪到 ResolveURL 之后，这里会走网络路径/空指针，用例不再通过）。
+// 变异验证：删掉 Run 里的 validateAudioFormat 调用 → 本用例红。
+func TestRunRejectsInvalidAudioFormatBeforeNetwork(t *testing.T) {
+	cfg := config.DefaultMyOption()
+	cfg.URL = "https://www.bilibili.com/video/BV1xx411c7mD"
+	w := New(cfg, nil)
+	w.SetAudioFormat("mp3")
+	err := w.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--audio-format") {
+		t.Fatalf("非法 --audio-format 应在任何网络请求前被拒绝，实际 err=%v", err)
 	}
 }
