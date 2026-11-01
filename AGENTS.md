@@ -123,9 +123,9 @@ go build ./... && go vet ./... && go test ./...
 
 规格来源有四个，任一更新都可触发动作，不必等某个仓库发版：
 
-1. `AliverAnme/BBDown` —— 参考基线（tags `v1.6.11`~`v1.6.20`，本地 git 对象库即可查）；
-2. `LOVAHE/BBDownT` —— C# 2.x 接手线，**风控与接口变更的情报价值最高**；
-3. `bilibili-API-collect` —— 接口规格；
+1. `AliverAnme/BBDown` —— 参考基线（tags `v1.6.11`~`v1.7.8`，本地 git 对象库即可查，`git fetch upstream --tags` 更新）；
+2. `LOVAHE/BBDownT` —— C# 2.x 接手线，**风控与接口变更的情报价值最高**（已发 v2.2.0）；
+3. `bilibili-API-collect` —— 接口规格；**⚠️ 2026-01 起仓库已弃用关停**（README 声明「停止维护并永久关停」），降权为历史参考，接口结论以实测与上游为准；
 4. **实测** —— 探针脚本 + `--debug` 日志；与前三者冲突时**以实测为准**。
 
 

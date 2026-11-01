@@ -150,13 +150,25 @@
 ### 3.1.0 批次（2026-10-17）闭环（上游同步大批次）
 
 - 完成：同病修复五件（aria2c 完整性 / token 横幅分流 / grpc-status / live 完整性 / 下载硬化两件 / 工具路径告警）+ BBDownT 功能件六件（--delay-per-item / 字幕双开关 / --audio-language+换轨 / --delay-per-video+--download-all / self-update）；登记 §4.73。
-- 候选（按优先级）：① APP/INTL 的 cur_language 重请求；② 多线程续传 + 分片布局校验（独立功能批次，2~3 人日）；③ util.PostResponseWithHeaders 收敛（postGRPC 的 412 文案/64MiB 上限）；④ tokenAuthMode 与 ParseModeName 单一定义；⑤ live 合并产物重复帧上限；⑥ --audio-format 开关（溏心音乐）；⑦ Web 背景三套；⑧ 五期下载并行实现。
+- 候选（按优先级）：① APP/INTL 的 cur_language 重请求；② 多线程续传 + 分片布局校验（独立功能批次，2~3 人日）；③ util.PostResponseWithHeaders 收敛（postGRPC 的 412 文案/64MiB 上限）；④ tokenAuthMode 与 ParseModeName 单一定义；⑤ live 合并产物重复帧上限；⑥ --audio-format 开关（溏心音乐）✅ 已完成（3.1.1）；⑦ Web 背景三套；⑧ 五期下载并行实现。
+
+### 3.1.1 批次（2026-11-01）闭环
+
+- 完成：仅音频默认按原生格式输出（FLAC 轨 → .flac 含封面；AAC/E-AC-3 → .m4a 不变）+ `--audio-format` 参数（m4a 强制 MP4 包装 / flac 仅 FLAC 轨合法 / 非法值发起网络前拒绝 / 大小写不敏感）；登记 §4.74。
+- 遗留：`--audio-format` 仅注册在主下载命令（watchlater/sub-check 未注册该旗标，与 `--audio-language` 现状一致；两路径亦无 `--audio-only`，无用户影响，后续一并处理）。
+- 新增候选（2026-11-01 上游对照：v1.7.4–v1.7.8 + BBDownT 2.2.0 + API-collect 弃用）：
+  1. serve 加固包：webhook URL 日志脱敏 + 回调不走系统代理 + 任务 JSON/serve 日志 0600（上游 #113/#114，约 0.5–1 人日）；
+  2. 测试补强：TV 番剧字符串 result 矩阵 + 空订阅非法 delay（约 2h）；
+  3. 残留清理：硬杀后 `<base>.muxing-*` 清扫（约 1h）；
+  4. 多线程续传 + 分片布局校验（上游 1.7.4 确认价值，2~3 人日）；
+  5. BBDownT 2.2.0 课程/国际站修复复核（本地源码已 clone 至 /tmp/BBDownT-inspect）；
+  6. `--work-dir` 默认落点（程序目录 Download vs 当前目录）——**待用户拍板**。
 
 
 ### 2.16.0 批次（2026-10-06）闭环（上游同步批次）
 
 - 完成：AI 字幕起死回生（XOR 解码 + 匿名门控移除）、DRM 开箱即用（内置 wvd/mp4decrypt + 自动解密默认开 + 前置检查）、订阅三件（--per-sub-dir/增量扫描/--full-scan）、mp4decrypt --key 修复、v_voucher 识别、argv 值位置 bug。
-- 已批准排队（下一工作周期）：① --audio-format 开关（溏心音乐封面兼容）；② Web 背景三套；③ CLI 宽度第二步（标题折行+事件行截断）；
+- 已批准排队（下一工作周期）：① --audio-format 开关（溏心音乐封面兼容）✅ 已完成（3.1.1）；② Web 背景三套；③ CLI 宽度第二步（标题折行+事件行截断）；
 - 候选：--skip-ai 默认值（现 true；AI 字幕已可下且匿名可用——是否改默认 false 待用户）；--ai-subtitle-policy（吸收 BBDownT）；sidecar 双常量统一；「取值标志全在表」自检用例；BBDownT 断点续传/国际站修复评估。
 
 
@@ -164,7 +176,7 @@
 
 - 完成：字幕诚实回退（混淆令牌过滤 + 侧车四态）、Web 输入简化（短号/多行批量/文件导入）、CLI 信息行宽度治理第一步（三档 0 超宽）、emoji 宽度区间补全、cli-width-audit.md。
 - 遗留/观察：**AI 字幕（ai-zh）生态内无人可下**（B 站混淆令牌，上游与 BBDownT 均无解；若现公开解码方案则跟进）。
-- 已批准排队（下一工作周期，用户拍板）：① --audio-format 开关（FLAC 封装原生 .flac，溏心音乐封面兼容）；② Web 背景三套（品牌渐变/四预设/跟随系统，docs/bbdown-ui-bg-v1/v2/v3.png）；③ CLI 宽度第二步（标题行折行 + 事件行截断，实现时登记 UPSTREAM_ALIGNMENT 有意偏离）。
+- 已批准排队（下一工作周期，用户拍板）：① --audio-format 开关（FLAC 封装原生 .flac，溏心音乐封面兼容）✅ 已完成（3.1.1）；② Web 背景三套（品牌渐变/四预设/跟随系统，docs/bbdown-ui-bg-v1/v2/v3.png）；③ CLI 宽度第二步（标题行折行 + 事件行截断，实现时登记 UPSTREAM_ALIGNMENT 有意偏离）。
 - 候选：--ai-subtitle-policy（吸收 BBDownT SubtitleSelection）；sidecar 双常量统一；debugScreenMaxCols 改 TerminalWidth()；短号+?query 前端接纳。
 
 - 新增遗留（随本批发现）：
