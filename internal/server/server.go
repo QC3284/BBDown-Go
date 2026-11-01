@@ -1252,6 +1252,44 @@ func (s *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// webhookLogTarget 返回回调地址适合写日志的形态：只保留 scheme://host[:port]，
+// 丢弃 path、query 与 userinfo。回调 URL 常带 token（查询参数或 userinfo），
+// 原样写进日志就是凭据泄漏（upstream #114 的 WebhookTargetForLog 同款策略）。
+func webhookLogTarget(raw string) string {
+	if raw == "" {
+		return "(未配置)"
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "(无效回调地址)"
+	}
+	// 主机名大小写不敏感，统一小写让日志可比较（IPv6 十六进制同理）。
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+}
+
+// callbackFailureLog 返回回调失败日志的正文：只保留错误类型，绝不回显错误值——
+// *url.Error 的 Error() 会带上完整 URL（含 query token），写进日志就是泄漏（upstream #114）。
+func callbackFailureLog(err error) string {
+	return fmt.Sprintf("回调失败（%T）", err)
+}
+
+// newCallbackTransport 返回回调专用 Transport：只拨已校验的 IP、不跟随重定向、
+// **不走系统代理**。显式把 Proxy 置 nil 是安全边界：若继承环境代理，回调会绕过
+// 上面「拨校验后 IP」的防护，走到一个未校验的代理地址（upstream #114 的回调直连）。
+func newCallbackTransport(dialAddr string) *http.Transport {
+	return &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Dial the VALIDATED IP: TLS SNI and the Host header still come
+			// from the original URL (upstream ConnectCallback).
+			var d net.Dialer
+			return d.DialContext(ctx, network, dialAddr)
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+}
+
 // sendCallback posts the task snapshot to the webhook on EVERY terminal state
 // (upstream), with the full SSRF guard: literal-IP and DNS branches are checked
 // with the same rules as upstream, the connection is dialed to a validated IP,
@@ -1262,7 +1300,7 @@ func (s *APIServer) sendCallback(task *DownloadTask) {
 	}
 	u, err := url.Parse(s.notifyWebhook)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		util.LogWarn("回调地址不合法，已跳过: %s", s.notifyWebhook)
+		util.LogWarn("回调地址不合法，已跳过: %s", webhookLogTarget(s.notifyWebhook))
 		return
 	}
 	host := u.Hostname()
@@ -1280,25 +1318,25 @@ func (s *APIServer) sendCallback(task *DownloadTask) {
 	if literal := net.ParseIP(host); literal != nil {
 		literal = normalizeMappedIP(literal)
 		if isUnsafeLiteralIP(literal) {
-			util.LogWarn("回调地址是敏感字面 IP，已跳过本次回调: %s", s.notifyWebhook)
+			util.LogWarn("回调地址是敏感字面 IP，已跳过本次回调: %s", webhookLogTarget(s.notifyWebhook))
 			return
 		}
 		target = literal
 	} else {
 		if strings.EqualFold(host, "localhost") {
-			util.LogWarn("回调地址不安全（内网地址），已跳过: %s", s.notifyWebhook)
+			util.LogWarn("回调地址不安全（内网地址），已跳过: %s", webhookLogTarget(s.notifyWebhook))
 			return
 		}
 		addrs, err := dnsLookupIP(context.Background(), "ip", host)
 		if err != nil {
-			util.LogWarn("回调域名无法解析，已跳过: %s", s.notifyWebhook)
+			util.LogWarn("回调域名无法解析，已跳过: %s", webhookLogTarget(s.notifyWebhook))
 			return
 		}
 		var chosen net.IP
 		for _, a := range addrs {
 			a = normalizeMappedIP(a)
 			if isBlockedAddress(a) {
-				util.LogWarn("回调地址不安全（内网地址），已跳过: %s", s.notifyWebhook)
+				util.LogWarn("回调地址不安全（内网地址），已跳过: %s", webhookLogTarget(s.notifyWebhook))
 				return
 			}
 			if chosen == nil {
@@ -1315,7 +1353,8 @@ func (s *APIServer) sendCallback(task *DownloadTask) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.notifyWebhook, strings.NewReader(string(body)))
 	if err != nil {
-		util.LogDebug("回调失败: %v", err)
+		// 只记目标与错误类型：错误的 Error() 可能带完整 URL（含 token）。
+		util.LogDebug("%s（目标 %s）", callbackFailureLog(err), webhookLogTarget(s.notifyWebhook))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -1326,21 +1365,11 @@ func (s *APIServer) sendCallback(task *DownloadTask) {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // no redirects
 		},
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Dial the VALIDATED IP: TLS SNI and the Host header still come
-				// from the original URL (upstream ConnectCallback).
-				var d net.Dialer
-				return d.DialContext(ctx, network, dialAddr)
-			},
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
+		Transport: newCallbackTransport(dialAddr),
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		util.LogDebug("回调失败: %v", err)
+		util.LogDebug("%s（目标 %s）", callbackFailureLog(err), webhookLogTarget(s.notifyWebhook))
 		return
 	}
 	defer resp.Body.Close()
@@ -1480,15 +1509,19 @@ func (s *APIServer) persistFinishedTasks() {
 	// A unique temp name: a shared "<file>.tmp" let two concurrent writers race
 	// onto the same path and rename a half-written file into place.
 	tmp := s.taskFile + ".tmp-" + generateJobID()
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 任务记录含任务参数与状态：Unix 上属主私有（0600），并压住 umask 造成的宽松权限。
+	if err := os.WriteFile(tmp, data, util.SecureFileMode()); err != nil {
 		return
 	}
+	util.TightenFilePermissions(tmp)
 	if err := os.Rename(tmp, s.taskFile); err != nil {
 		os.Remove(tmp)
 	}
 }
 
 func (s *APIServer) loadFinishedTasks() {
+	// 启动时收紧历史任务记录的权限（升级前可能是 0644；upstream #113 同样处理既有文件）。
+	util.TightenFilePermissions(s.taskFile)
 	data, err := os.ReadFile(s.taskFile)
 	if err != nil {
 		return

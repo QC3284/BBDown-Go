@@ -816,6 +816,42 @@ func TestParseDelayPerItem(t *testing.T) {
 	}
 }
 
+// TestSubCheckDelayPerItemValidatedWithoutSubscriptions 对应 upstream v1.7.8：订阅清单为空时
+// 也不能提前成功返回，--delay-per-item 越界必须在 PreRunE 阶段（任何网络请求/状态写入之前）
+// 报错退出 1。
+//
+// 变异验证：撤掉 subCheckCmd.PreRunE 的赋值 → 本用例红。
+func TestSubCheckDelayPerItemValidatedWithoutSubscriptions(t *testing.T) {
+	dir := t.TempDir()
+	setSubStoreRoot(t, dir)
+	origFlag := optSubCheckDelayPerItem
+	optSubCheckDelayPerItem = 0
+	t.Cleanup(func() { optSubCheckDelayPerItem = origFlag })
+
+	if subCheckCmd.PreRunE == nil {
+		t.Fatal("sub check 必须在 PreRunE 校验 --delay-per-item")
+	}
+	before := dirSignature(t, dir)
+	optSubCheckDelayPerItem = 601
+	err := subCheckCmd.PreRunE(subCheckCmd, nil)
+	if err == nil {
+		t.Fatal("--delay-per-item 越界时 PreRunE 应当报错（即使一条订阅都没有）")
+	}
+	for _, want := range []string{"--delay-per-item", "0-600"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误文案缺少 %q：%v", want, err)
+		}
+	}
+	if after := dirSignature(t, dir); after != before {
+		t.Errorf("PreRunE 校验失败不应写订阅状态：before=%q after=%q", before, after)
+	}
+	// 合法值放行，RunE 才会走到「无订阅 → 成功返回」。
+	optSubCheckDelayPerItem = 600
+	if err := subCheckCmd.PreRunE(subCheckCmd, nil); err != nil {
+		t.Errorf("合法值 600 不该被 PreRunE 拒绝：%v", err)
+	}
+}
+
 // TestSubCheckDelayEventFlow 是核心用例：两个订阅各一个新增内容，--delay-per-item 2s →
 // 事件流必须是 list → delay → download → delay → list → delay → download，
 // 即「首个单元不等待、之后每个单元前都停顿」。

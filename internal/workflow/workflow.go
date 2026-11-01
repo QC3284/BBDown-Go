@@ -712,11 +712,7 @@ func (w *Workflow) downloadOnePage(ctx context.Context, p *parser.Parser, page e
 		// Skip if exists（上游语义）。--overwrite 时跳过这一步：归档里想重下/重编码时需要它，
 		// 否则只能手动删文件（本仓新增开关，见 §4.44）。
 		if shouldSkipProduct(w.Cfg.Overwrite, savePath) {
-			util.Log("%s 已存在, 跳过下载...", savePath)
-			// 已存在的产物同样是「已产出」：不登记的话，对已经下好的库补开 --write-m3u
-			// 会什么都不生成，中断后重跑也会缺掉被跳过的分P。
-			w.writeM3USidecar(savePath, title, page)
-			return true
+			return w.handleExistingProduct(savePath, title, page)
 		}
 		if w.Cfg.Overwrite {
 			if _, err := os.Stat(savePath); err == nil {
@@ -1807,6 +1803,20 @@ func shouldSkipProduct(overwrite bool, savePath string) bool {
 func skipExistingProduct(savePath string) bool {
 	info, err := os.Stat(savePath)
 	return err == nil && info.Size() > 0
+}
+
+// handleExistingProduct 处理「产物已存在、跳过下载」分支：日志 + 回收产物级残留 +
+// --write-m3u 侧车登记。抽成方法是为了让整条分支可以被下载层之外的用例直接驱动
+// （m3u 接线与混流残留清理都依赖它，而不是只测纯函数）。
+func (w *Workflow) handleExistingProduct(savePath, title string, page entity.Page) bool {
+	util.Log("%s 已存在, 跳过下载...", savePath)
+	// 上次进程若被硬杀（SIGKILL），混流临时件来不及删；跳过分支不再经过混流代码，
+	// 只能在这里回收（upstream 1.7.5 的 .merging 清理同款）。
+	download.CleanupProductResidues(savePath)
+	// 已存在的产物同样是「已产出」：不登记的话，对已经下好的库补开 --write-m3u
+	// 会什么都不生成，中断后重跑也会缺掉被跳过的分P。
+	w.writeM3USidecar(savePath, title, page)
+	return true
 }
 
 // filterCompatTracks 过滤掉「本机/多数播放器可能播不了」的档位（HDR Vivid / 杜比视界），供 `--compat` 用：

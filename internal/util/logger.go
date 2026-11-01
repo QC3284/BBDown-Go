@@ -181,6 +181,9 @@ func (l *Logger) SetLogFile(path string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.logFilePath = path
+	// 启动时把已存在的日志文件收紧到属主可读（upstream #113：进程私有文件 0600）。
+	// 之后新创建的文件由 writeLine 的 SecureFileMode + 句柄收紧紧跟上。
+	TightenFilePermissions(path)
 }
 
 // logFailureCooldown is how long file logging is suspended after
@@ -222,11 +225,14 @@ func (l *Logger) appendToFile(line string) {
 
 // writeLine appends one line, flushing before close.
 func writeLine(path, line string) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// 进程私有的日志文件：Unix 上创建即 0600（Windows 保留 0644）。
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, SecureFileMode())
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// 升级前留下的日志文件可能仍是 0644，每行打开时顺路收紧（Unix；Windows no-op）。
+	TightenOpenFilePermissions(f)
 	if _, err := fmt.Fprintln(f, line); err != nil {
 		return err
 	}

@@ -389,17 +389,7 @@ func cleanupResidue(destPath string) {
 				continue
 			}
 			mid := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".vclip")
-			if mid == "" {
-				continue
-			}
-			digits := true
-			for _, r := range mid {
-				if r < '0' || r > '9' {
-					digits = false
-					break
-				}
-			}
-			if digits {
+			if mid != "" && isAllDigits(mid) {
 				removeIfExists(filepath.Join(dir, name))
 			}
 		}
@@ -409,6 +399,50 @@ func cleanupResidue(destPath string) {
 	if entries, err := os.ReadDir(destPath + ".segs"); err == nil && len(entries) == 0 {
 		removeIfExists(destPath + ".segs")
 	}
+}
+
+// CleanupProductResidues 在「产物已完整、跳过下载」时回收**产物级**的混流临时文件。
+//
+// 混流临时件由 workflow 写成 <base>.muxing-<UnixNano><ext>（成功即 rename，失败即删）；
+// 进程被硬杀（SIGKILL）/断电时这次删除来不及发生，而下次重跑走「已存在, 跳过下载」分支
+// 根本不会再执行混流代码——垃圾就永久留在产物目录（upstream 1.7.5 补的 .merging 清理同款）。
+// 只认「<base>.muxing-<纯数字><ext>」这一种形态，避免误删同目录下的同名兄弟文件。
+func CleanupProductResidues(productPath string) {
+	ext := filepath.Ext(productPath)
+	dir := filepath.Dir(productPath)
+	base := strings.TrimSuffix(filepath.Base(productPath), ext)
+	prefix := base + ".muxing-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ext) {
+			continue
+		}
+		mid := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ext)
+		if mid == "" || !isAllDigits(mid) {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if err := os.Remove(path); err == nil {
+			util.LogDebug("已清理残留: %s", path)
+		}
+	}
+}
+
+// isAllDigits 报告 s 是否非空且全部是 ASCII 数字（用于精确匹配分片/混流临时名的序号段）。
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // removeStaleAria2Control 在**非 aria2c** 路径成功落盘之后清掉遗留的 aria2 控制文件。
