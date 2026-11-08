@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,11 +99,39 @@ func isolateCorruptFile(path string) string {
 	return corrupt
 }
 
+// isolatedCopyOf returns the newest quarantined copy of path ("<name>.corrupt-*",
+// written by isolateCorruptFile), or "" when none exists. os.ReadDir sorts entries
+// by filename, so the last match is the most recent timestamp.
+func isolatedCopyOf(path string) string {
+	dir := filepath.Dir(path)
+	prefix := filepath.Base(path) + ".corrupt-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	found := ""
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
+			found = filepath.Join(dir, e.Name())
+		}
+	}
+	return found
+}
+
 // Load returns the subscription list. Corruption aborts with CorruptError.
 func Load() ([]Subscription, error) {
 	data, err := os.ReadFile(subFile())
 	if err != nil {
 		if os.IsNotExist(err) {
+			// A missing file with a quarantined sibling means an earlier run already
+			// isolated a corrupt manifest: treating this as an empty store would hide
+			// the data loss and let the next write start over (upstream 1.7.9
+			// ThrowIfIsolatedFileExists).
+			if isolated := isolatedCopyOf(subFile()); isolated != "" {
+				return nil, &CorruptError{fmt.Sprintf(
+					"订阅清单 %s 缺失，但发现隔离副本 %s（上次读取失败时已隔离）。请恢复清单文件，或确认放弃数据后把隔离副本移出目录再重试",
+					subFile(), isolated)}
+			}
 			return nil, nil
 		}
 		return nil, &CorruptError{fmt.Sprintf("读取订阅清单失败: %v", err)}
@@ -174,6 +203,11 @@ func LoadHistory(target string) ([]string, error) {
 	data, err := os.ReadFile(historyFile())
 	if err != nil {
 		if os.IsNotExist(err) {
+			if isolated := isolatedCopyOf(historyFile()); isolated != "" {
+				return nil, &CorruptError{fmt.Sprintf(
+					"订阅历史 %s 缺失，但发现隔离副本 %s（上次读取失败时已隔离）。请恢复历史文件，或确认放弃数据后把隔离副本移出目录再重试",
+					historyFile(), isolated)}
+			}
 			return nil, nil
 		}
 		return nil, &CorruptError{fmt.Sprintf("读取订阅历史失败: %v", err)}

@@ -274,9 +274,11 @@ func manifestIdentity(m resumeManifest) string {
 	return ""
 }
 
-// manifestMatchesProbe 判断清单是否仍代表当前探测到的资源（上游 CanResumeFromAsync）：
-// 稳定身份与总长必须一致；ETag/Last-Modified 只在**双方都有**时才比较——有些 CDN 不返回，
-// 单边缺失时退化为「身份 + 长度」判断。
+// manifestMatchesProbe 判断清单是否仍代表当前探测到的资源（上游 79e3a91 起收紧，对应
+// BBDownDownloadUtil.CanResumeFromAsync）：稳定身份与总长必须一致；资源校验器（ETag /
+// Last-Modified）必须**双方同时存在或同时缺失**，且至少有一种双方都有的类型可比较。
+// 旧实现只在双方都有某类校验器时才比较，单边缺失/类型不相交时退化为「身份 + 长度」——
+// CDN 换文件但长度相同时，旧 .tmp 会被当作可续传前缀（用户 2026-11-08 批准 D1 收紧）。
 func manifestMatchesProbe(m resumeManifest, identity string, size int64, etag, lastModified string) bool {
 	if manifestIdentity(m) != identity {
 		return false
@@ -284,10 +286,26 @@ func manifestMatchesProbe(m resumeManifest, identity string, size int64, etag, l
 	if m.Size != size {
 		return false
 	}
-	if etag != "" && m.ETag != "" && m.ETag != etag {
+	previousHasValidator := m.ETag != "" || m.LastModified != ""
+	currentHasValidator := etag != "" || lastModified != ""
+	// 一方有校验器、另一方没有：无法确认资源版本，宁可重下（上游 presence 不一致即拒绝）。
+	if previousHasValidator != currentHasValidator {
 		return false
 	}
-	if lastModified != "" && m.LastModified != "" && !strings.EqualFold(m.LastModified, lastModified) {
+	if !previousHasValidator {
+		// 双方都没有校验器：退化为身份 + 长度（与 3.1.2 及更早行为一致）。
+		return true
+	}
+	comparableETag := m.ETag != "" && etag != ""
+	comparableLastModified := m.LastModified != "" && lastModified != ""
+	if !comparableETag && !comparableLastModified {
+		// 双方各有一类但类型不相交，没有任何可比较的版本标识。
+		return false
+	}
+	if comparableETag && m.ETag != etag {
+		return false
+	}
+	if comparableLastModified && !strings.EqualFold(m.LastModified, lastModified) {
 		return false
 	}
 	return true
@@ -607,14 +625,10 @@ func singleDownload(ctx context.Context, url, destPath string, pr probeResult, c
 		os.Remove(metaPath)
 	}
 
-	// Write the manifest BEFORE the first byte: an interrupted .tmp must carry a
-	// manifest or the next run cannot trust it and has to redownload.
-	{
-		m := resumeManifest{Identity: currentIdentity, URL: url, Size: pr.size, ETag: pr.etag, LastModified: pr.lastModified}
-		if data, err := json.Marshal(m); err == nil {
-			os.WriteFile(metaPath, data, 0o644)
-		}
-	}
+	// 续传判定必须基于**上一轮进程**留下的清单：下面的下载循环会在首字节前把清单改写成本次
+	// 探测值。若先写后读，比较永远对着自己——身份/校验器校验形同虚设（本仓 3.1.2 及更早的
+	// 缺陷；上游 PrepareSingleThreadTargetAsync 先读旧清单做决策，下载前才写新清单）。
+	previousManifest, hadPreviousManifest := readManifest()
 
 	lastErr := fmt.Errorf("download failed")
 	// 候选链：主地址在前，替换前的原地址与 playurl 的 backup_url 依次在后（本仓有意差异，§4.33）。
@@ -629,7 +643,12 @@ func singleDownload(ctx context.Context, url, destPath string, pr probeResult, c
 		var ifRange string
 		if pr.size > 0 {
 			if info, err := os.Stat(tmp); err == nil {
-				m, ok := readManifest()
+				// 首个 attempt 用上一轮进程留下的清单判定（此时尚未被本次探测值覆盖）；
+				// 同一次运行内的重试读本次写下的清单（描述当前资源的部分前缀）。
+				m, ok := previousManifest, hadPreviousManifest
+				if attempt > 0 {
+					m, ok = readManifest()
+				}
 				trusted := ok && identityMatches(m)
 				switch {
 				case info.Size() == pr.size && trusted:
@@ -642,11 +661,9 @@ func singleDownload(ctx context.Context, url, destPath string, pr probeResult, c
 					return nil
 				case info.Size() > 0 && info.Size() < pr.size && trusted:
 					offset = info.Size()
-					if m.ETag != "" {
-						ifRange = m.ETag
-					} else if m.LastModified != "" {
-						ifRange = m.LastModified
-					}
+					// RFC 7233 forbids weak validators in If-Range; fall back to
+					// Last-Modified so the server can still confirm the prefix.
+					ifRange = selectIfRange(m.ETag, m.LastModified)
 					util.LogDebug("断点续传: 从现有临时文件 %d 字节处继续（资源身份一致）", offset)
 				case !trusted || info.Size() > pr.size:
 					// Stale prefix / changed resource / oversized tmp: discard.
@@ -654,6 +671,15 @@ func singleDownload(ctx context.Context, url, destPath string, pr probeResult, c
 					os.Remove(tmp)
 					os.Remove(metaPath)
 				}
+			}
+		}
+
+		// Write the manifest BEFORE the first byte: an interrupted .tmp must carry a
+		// manifest or the next run cannot trust it and has to redownload.
+		{
+			m := resumeManifest{Identity: currentIdentity, URL: url, Size: pr.size, ETag: pr.etag, LastModified: pr.lastModified}
+			if data, err := json.Marshal(m); err == nil {
+				os.WriteFile(metaPath, data, 0o644)
 			}
 		}
 
@@ -844,6 +870,20 @@ func rangeStart(contentRange string) int64 {
 		}
 	}
 	return -1
+}
+
+// selectIfRange picks the validator for an If-Range header (upstream
+// BBDownDownloadUtil.SelectIfRange): a strong ETag wins; a weak ETag
+// ("W/...") is forbidden by RFC 7233 and falls back to Last-Modified; with
+// neither, no If-Range is sent and the 200/206 response decides.
+func selectIfRange(etag, lastModified string) string {
+	if e := strings.TrimSpace(etag); e != "" && !strings.HasPrefix(e, "W/") && !strings.HasPrefix(e, "w/") {
+		return e
+	}
+	if lm := strings.TrimSpace(lastModified); lm != "" {
+		return lm
+	}
+	return ""
 }
 
 // shardGroup 管理一次多线程下载的分片生命周期（t89，t82 评估 ②）：

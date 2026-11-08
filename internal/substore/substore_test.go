@@ -90,6 +90,53 @@ func TestSubStoreCorruptDetection(t *testing.T) {
 	}
 }
 
+// TestSubStoreAbortsWhenDataFileMissingButIsolatedCopyExists pins the upstream
+// 1.7.9 ThrowIfIsolatedFileExists rule: once a corrupt store was quarantined,
+// the next run must abort with a readable error naming the .corrupt-* copy
+// instead of silently treating the store as empty (which hides the data loss
+// and lets the next write start over with a fresh list/history).
+//
+// 变异验证：删掉 Load/LoadHistory 里的 isolatedCopyOf 分支（退回 return nil, nil）
+// → 本用例的「必须报错」断言变红。
+func TestSubStoreAbortsWhenDataFileMissingButIsolatedCopyExists(t *testing.T) {
+	dir := withTempRoot(t)
+	store := filepath.Join(dir, "BBDownSubscriptions.json")
+	iso := store + ".corrupt-20260101120000.000-1"
+	if err := os.WriteFile(iso, []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load()
+	if err == nil {
+		t.Fatal("订阅清单缺失但存在隔离副本时必须报错，而不是当作空清单")
+	}
+	if !strings.Contains(err.Error(), "隔离副本") || !strings.Contains(err.Error(), iso) {
+		t.Fatalf("报错必须点名隔离副本，实际: %v", err)
+	}
+
+	history := filepath.Join(dir, "BBDownSubscriptions.history.json")
+	historyISO := history + ".corrupt-20260101120000.000-2"
+	if err := os.WriteFile(historyISO, []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadHistory("mid:1"); err == nil {
+		t.Fatal("订阅历史缺失但存在隔离副本时必须报错")
+	} else if !strings.Contains(err.Error(), "隔离副本") || !strings.Contains(err.Error(), historyISO) {
+		t.Fatalf("历史报错必须点名隔离副本，实际: %v", err)
+	}
+
+	// 没有隔离副本时保持原语义：数据文件缺失 = 空清单（首次使用）。
+	empty := t.TempDir()
+	old := StoreRoot
+	StoreRoot = empty
+	t.Cleanup(func() { StoreRoot = old })
+	if subs, err := Load(); err != nil || subs != nil {
+		t.Fatalf("首次使用（无清单、无隔离副本）应为空清单: subs=%v err=%v", subs, err)
+	}
+	if h, err := LoadHistory("mid:1"); err != nil || h != nil {
+		t.Fatalf("首次使用（无历史、无隔离副本）应为空历史: h=%v err=%v", h, err)
+	}
+}
+
 // F6 订阅过滤：--filter 是稿件标题正则，存进清单、旧文件兼容、非法正则当场报错。
 
 // TestSubStoreFilterPersistsAndStaysOptional: 过滤条件存进 JSON（F6），

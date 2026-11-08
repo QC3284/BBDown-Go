@@ -596,7 +596,9 @@ func (s *APIServer) hostAllowed(hostHeader string) bool {
 }
 
 // originAllowed accepts requests without an Origin header (CLI clients) and
-// same-origin browser requests only.
+// same-origin browser requests only. "Same origin" is scheme+host+port
+// (RFC 6454): comparing Host alone would treat an https page driving a plain
+// http serve (or a downgraded request) as same-origin.
 func (s *APIServer) originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -604,6 +606,13 @@ func (s *APIServer) originAllowed(r *http.Request) bool {
 	}
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, scheme) {
 		return false
 	}
 	return strings.EqualFold(u.Host, r.Host)

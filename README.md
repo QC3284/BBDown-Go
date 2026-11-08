@@ -149,7 +149,7 @@ https://www.bilibili.com/video/BV1xx411c7mD
 `/add-task` 是**严格 15 字段白名单**（snake_case）：`url` `select_page` `dfn_priority` `encoding_priority` `multi_thread` `overwrite` `skip_mux` `skip_ai` `write_nfo` `compat` `use_app_api` `use_tv_api` `use_intl_api` `work_dir` `language`——
 未知字段或非法值一律 400 并点名字段；`bool` 用指针区分「未传」与 `false`（与默认相同即不传）；`select_page` 复用 CLI 解析器并有 1000 项上限；危险字段（`interactive`/`file_pattern`/`cookie`/`notify_webhook` 等）不开放；只发 `url` 的老客户端行为不变。
 `Progress` 保持 0~1 边界语义（执行期 0、成功 1.0）；`TotalDownloadedBytes` 在下载执行期间与 SSE 的真实字节同口径（多产物任务按文件身份求和）。
-完成列表持久化到 `bbdown-tasks.json`（保留 30 天 / 最近 1000 条）；`--notify-webhook` 仅接受公网地址；`Cache-Control: no-store` 且写端点要求 `Content-Type: application/json`（CSRF 闸门）。
+完成列表持久化到 `bbdown-tasks.json`（保留 30 天 / 最近 1000 条）；`--notify-webhook` 仅接受公网地址；`Cache-Control: no-store`，写端点要求 `Content-Type: application/json` 且 `Origin`（若带）必须与请求的 scheme+host+port 同源（CSRF 闸门）。
 
 ## 测试与 CI
 

@@ -149,20 +149,20 @@ func MergeWithConfig(cliArgs []string, aliasMap map[string]string, boolFlags map
 
 		if explicitOptions[canonical] {
 			i++
-			// Skip the config value(s) for this option: collect tokens until the
-			// next known option name.
-			for i < len(configArgs) && (!strings.HasPrefix(configArgs[i], "-") || !isKnownOption(configArgs[i], aliasMap)) {
-				i++
-			}
+			// Skip exactly this option's config value(s). The previous loop
+			// collected tokens until the next known option, which also swallowed a
+			// trailing positional URL: config "--cookie <value>\n<URL>" plus a CLI
+			// --cookie override lost the URL from the merged args (upstream
+			// BBDownConfigParser.CountOptionValueTokens).
+			i += optionValueCount(configArgs, i, canonical, aliasMap, boolFlags)
 			continue
 		}
 
 		result = append(result, name)
 		i++
-		for i < len(configArgs) && (!strings.HasPrefix(configArgs[i], "-") || !isKnownOption(configArgs[i], aliasMap)) {
-			result = append(result, configArgs[i])
-			i++
-		}
+		n := optionValueCount(configArgs, i, canonical, aliasMap, boolFlags)
+		result = append(result, configArgs[i:i+n]...)
+		i += n
 	}
 
 	return result, nil
@@ -171,6 +171,33 @@ func MergeWithConfig(cliArgs []string, aliasMap map[string]string, boolFlags map
 func isKnownOption(token string, aliasMap map[string]string) bool {
 	_, ok := aliasMap[token]
 	return ok
+}
+
+// optionValueCount returns how many tokens after index belong to the value of
+// the option whose canonical name is canonical (upstream
+// BBDownConfigParser.CountOptionValueTokens).
+//
+// A boolean option takes at most one explicit "true"/"false"; a value option
+// takes exactly one token — even one starting with '-' (config values like
+// "-access-token-value" must survive) — unless that token is itself a known
+// option, i.e. the option was written without a value. Limiting the count to
+// the real value token is what stops a trailing config URL from being consumed
+// when the CLI overrides the same option.
+func optionValueCount(args []string, index int, canonical string, aliasMap map[string]string, boolFlags map[string]bool) int {
+	if index >= len(args) {
+		return 0
+	}
+	if boolFlags[canonical] {
+		v := strings.TrimSpace(args[index])
+		if strings.EqualFold(v, "true") || strings.EqualFold(v, "false") {
+			return 1
+		}
+		return 0
+	}
+	if isKnownOption(args[index], aliasMap) {
+		return 0
+	}
+	return 1
 }
 
 // appDir returns the executable directory (config default location).

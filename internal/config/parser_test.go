@@ -104,3 +104,71 @@ func TestMergeWithConfigKeepsURLWhenOptionValueLooksLikeURL(t *testing.T) {
 		t.Errorf("config URL should be dropped when the CLI already carries one: %v", merged)
 	}
 }
+
+// TestMergeWithConfigKeepsTrailingURLWhenOptionOverridden pins the upstream
+// 1.7.9 ConfigParser fix: when the CLI overrides an option that also appears in
+// BBDown.config, only that option's own value may be skipped — the config
+// file's trailing positional URL must survive. The old "collect tokens until
+// the next known option" loop consumed it, so a CLI override silently dropped
+// the target and the run failed with "请提供视频地址".
+//
+// 变异验证：把 MergeWithConfig 里的 optionValueCount 换回「收集到下一个已知选项」
+// 的旧循环 → 下列 URL 存活断言变红。
+func TestMergeWithConfigKeepsTrailingURLWhenOptionOverridden(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "BBDown.config")
+	content := "--cookie\nSESSDATA=from_config\nhttps://www.bilibili.com/video/BV1xx411c7mD\n"
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	aliasMap := map[string]string{
+		"--config-file": "config-file",
+		"--cookie":      "cookie",
+		"-c":            "cookie",
+		"--debug":       "debug",
+	}
+	boolFlags := map[string]bool{"config-file": false, "cookie": false, "debug": true}
+	const configURL = "https://www.bilibili.com/video/BV1xx411c7mD"
+
+	// 1) 取值选项被命令行覆盖：配置里的取值跳过，但后面的 URL 必须留下。
+	merged, err := MergeWithConfig([]string{"--config-file", cfgPath, "--cookie", "SESSDATA=from_cli"}, aliasMap, boolFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined := strings.Join(merged, " "); !strings.Contains(joined, configURL) {
+		t.Fatalf("CLI 覆盖 --cookie 后配置 URL 被吞：%v", merged)
+	}
+	// 覆盖值本身仍必须生效（不能把配置值追加回来压掉命令行）。
+	if !strings.Contains(strings.Join(merged, " "), "SESSDATA=from_cli") ||
+		strings.Contains(strings.Join(merged, " "), "SESSDATA=from_config") {
+		t.Fatalf("命令行覆盖值没有生效：%v", merged)
+	}
+
+	// 2) 布尔选项被命令行覆盖：布尔只吃可选的 true/false，URL 不能被当成它的值。
+	merged, err = MergeWithConfig([]string{"--config-file", cfgPath, "--debug"}, aliasMap, boolFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(merged, " "), configURL) {
+		t.Fatalf("CLI 覆盖布尔选项后配置 URL 被吞：%v", merged)
+	}
+
+	// 3) 等号写法的覆盖同样只跳过取值，URL 留下。
+	merged, err = MergeWithConfig([]string{"--config-file", cfgPath, "--cookie=SESSDATA=from_cli"}, aliasMap, boolFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(merged, " "), configURL) {
+		t.Fatalf("等号写法覆盖后配置 URL 被吞：%v", merged)
+	}
+
+	// 4) CLI 自带 URL 时仍按既有规则丢弃配置 URL（这次修复不改变该语义）。
+	merged, err = MergeWithConfig([]string{"--config-file", cfgPath, "--cookie", "x", "av170001"}, aliasMap, boolFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(merged, " "), configURL) {
+		t.Fatalf("CLI 已带 URL 时配置 URL 应被丢弃：%v", merged)
+	}
+}

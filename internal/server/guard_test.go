@@ -114,3 +114,36 @@ func TestBuildHandlerSecurityHeaders(t *testing.T) {
 		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
 	}
 }
+
+// TestOriginSchemeMustMatch pins RFC 6454 same-origin semantics for the CSRF
+// gate: Host alone is not enough — the Origin scheme must match the request
+// scheme, otherwise an https page with the same host:port passes as same-origin.
+//
+// 变异验证：删掉 originAllowed 里的 scheme 比较 → 第一条断言（https Origin 打到
+// http 请求）变红。
+func TestOriginSchemeMustMatch(t *testing.T) {
+	s := newLoopbackServer(t)
+	h := s.buildHandler()
+	const host = "127.0.0.1:23333"
+	// 故意发送非法 JSON：400 证明请求已经穿过 CSRF 闸门，且不产生异步任务副作用。
+	const body = "not-json"
+
+	httpTarget := "http://127.0.0.1:23333/add-task"
+	if got := do(h, http.MethodPost, httpTarget, host, "https://"+host, "application/json", body).Code; got != http.StatusForbidden {
+		t.Errorf("https Origin on an http request: status %d, want 403", got)
+	}
+	if got := do(h, http.MethodPost, httpTarget, host, "http://"+host, "application/json", body).Code; got != http.StatusBadRequest {
+		t.Errorf("same scheme+host+port origin must pass the guard (400 for the malformed body), got %d", got)
+	}
+
+	// TLS 请求与 https Origin 才是同源（httptest.NewRequest 对 https target 会置 fake TLS）。
+	req := httptest.NewRequest(http.MethodPost, "https://127.0.0.1:23333/add-task", strings.NewReader(body))
+	req.Host = host
+	req.Header.Set("Origin", "https://"+host)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("https Origin on a TLS request must pass the guard (400 expected), got %d", rec.Code)
+	}
+}
