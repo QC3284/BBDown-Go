@@ -1137,6 +1137,19 @@ SubtitleItem{lan=3,lanDoc=4,subtitleUrl=5}）。只手解三个字段（手写 v
 - **混流残留清扫**（上游 1.7.5 同族）：CleanupProductResidues 只清 <base>.muxing-<数字><后缀>（生产命名 %s.muxing-%d%s），非数字后缀/其它产物/.tmp 不误伤；skip 分支重构为 handleExistingProduct。
 - **测试补强**：TV 番剧非对象 result 六夹具（string "suee"/null/number/array/missing + 非对象根 []）钉住 Go 断言对 1.7.6 同病的免疫（§4.74 已免疫项补回放矩阵）；空订阅 --delay-per-item 越界在 PreRunE 拒绝（1.7.8 同病）。
 
+### 4.76 第七十一轮：--work-dir 默认落点保持现状（用户定 2026-11-08）
+
+- 上游 v1.7.7 起 CLI 默认 --work-dir 改为程序目录下 Download；用户拍板（2026-11-08）：**保持现状**——不传 --work-dir 时默认当前目录，属**有意偏离**，不再跟进上游此行为变更。
+
+### 4.77 第七十二轮：上游 master 增量（79e3a91 / 70f5423 适用件 / #113-#114 对账收尾）
+
+- **续传校验器严格规则（对齐 79e3a91，用户批准 D1）**：双方校验器存在性一致；都有校验器时须有同类型配对（ETag/Last-Modified 各自比较）；类型不相交拒续传；双方皆空维持身份+长度。配套修复：清单先读后写（3.1.2 及以前跨运行检查形同虚设）。
+- **弱 ETag If-Range 回退（70f5423 同族：.Tag→.ToString）**：强 ETag 优先，W/ 前缀回退 Last-Modified，皆无则不发。
+- **config 合并选项值计数（本仓独有 bug，上游无同款）**：带值选项只吃一个 token，行尾 URL 不再被吞。
+- **订阅隔离副本报错（70f5423 SubscriptionStore 同族）**：数据缺失但 .corrupt-* 存在 → 明确报错指出副本路径。
+- **Origin scheme 校验（#114 收尾）**：scheme+host+port（RFC 6454）。**有意偏离**：不限制回环——内置 Web UI 与局域网/token 部署需要浏览器写请求。
+- **已知限制（上游同限）**：scheme 仅取 r.TLS，TLS 终结代理下写端点 403；候选：对端匹配 --trusted-proxy 时信任 X-Forwarded-Proto（防伪安全式）。
+
 
 
 
