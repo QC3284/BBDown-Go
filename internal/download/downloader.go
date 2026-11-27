@@ -350,17 +350,53 @@ func (g *stallGuard) Stop() { g.timer.Stop() }
 // aria2ControlPath 返回 aria2c 为某个目标文件留下的控制文件路径（默认 <文件>.aria2）。
 func aria2ControlPath(destPath string) string { return destPath + ".aria2" }
 
-// hasAria2ControlFile 报告目标文件旁边是否还有 aria2c 控制文件（= 上一次没下完）。
-func hasAria2ControlFile(destPath string) bool {
-	_, err := os.Stat(aria2ControlPath(destPath))
+// aria2TempControlPath 返回 aria2c 控制文件的中间态路径（默认 <文件>.aria2__temp）。
+//
+// aria2 正常收尾时把它 rename 成 .aria2 后删除；Windows + aria2 1.37.0 的
+// --input-file=-（stdin）模式在进程退出后只留下这个中间态、没有 .aria2，断点续传因此
+// 失效（上游 v1.7.9 85fabe1）。它既没有可续传的块映射，预分配出来的等长产物也不可信。
+func aria2TempControlPath(destPath string) string { return destPath + ".aria2__temp" }
+
+// hasAria2TempControlFile 报告目标文件旁边是否还有 aria2c 控制文件的中间态。
+func hasAria2TempControlFile(destPath string) bool {
+	_, err := os.Stat(aria2TempControlPath(destPath))
 	return err == nil
+}
+
+// hasAria2ControlFile 报告目标文件旁边是否还有 aria2c 控制文件（= 上一次没下完）。
+// 中间态 .aria2__temp 同样算「没下完」：Windows + stdin 模式只留它，若只看 .aria2，
+// 预分配出来的等长残件会被当成完整文件跳过（上游 v1.7.9 85fabe1）。
+func hasAria2ControlFile(destPath string) bool {
+	if _, err := os.Stat(aria2ControlPath(destPath)); err == nil {
+		return true
+	}
+	return hasAria2TempControlFile(destPath)
+}
+
+// purgeAria2TempResidue 在发现 .aria2__temp 时丢弃不可信的预分配产物与两个控制文件
+// （上游 v1.7.9 85fabe1 的 PrepareAria2cTarget 同款）。每个文件都必须尝试删除，用位与
+// 语义：不能因为第一个删成功/失败就漏掉后面的。
+func purgeAria2TempResidue(destPath string) error {
+	ok := true
+	for _, stale := range []string{destPath, aria2ControlPath(destPath), aria2TempControlPath(destPath)} {
+		if err := os.Remove(stale); err != nil && !os.IsNotExist(err) {
+			util.LogDebug("清理 aria2 未收尾残留失败: %s: %v", stale, err)
+			ok = false
+		}
+	}
+	if !ok {
+		return fmt.Errorf("aria2c 无法清理未收尾的控制文件残留: %s，已中止下载（请手动删除后重试）", destPath)
+	}
+	return nil
 }
 
 // existingDownloadComplete 判定「磁盘上已有完整文件，可以跳过下载」。
 //
 // 大小相等只是**必要条件**：aria2c 用「预分配 + 控制文件」续传，中断时磁盘上的文件可能已经
-// 等于远端总长，只有 <文件>.aria2 还在才说明它是残的。只看大小会把残件当完整件跳过，
-// 后面混流就会拿半个视频去 mux（上游 1.7.4 修的正是这个）。控制文件**保留**给 aria2c 续传。
+// 等于远端总长，只有 <文件>.aria2（或 Windows + stdin 模式遗留的 .aria2__temp，见
+// hasAria2ControlFile）还在才说明它是残的。只看大小会把残件当完整件跳过，后面混流就会拿
+// 半个视频去 mux（上游 1.7.4 修的正是这个，v1.7.9 85fabe1 补上 .aria2__temp）。
+// 控制文件**保留**给 aria2c 续传。
 func existingDownloadComplete(destPath string, remoteSize int64) bool {
 	if remoteSize <= 0 {
 		return false
@@ -382,8 +418,10 @@ func existingDownloadComplete(destPath string, remoteSize int64) bool {
 //   - dest.segs（live 分段根目录）——**仅当它是空目录**。
 //
 // 不删：
-//   - dest.aria2：它的存在本身就说明「上次没下完」，existingDownloadComplete 会判未完成，
-//     这个分支根本走不到；留着给 aria2c 续传（t68）；
+//   - dest.aria2 / dest.aria2__temp：它们的存在本身就说明「上次没下完」，
+//     existingDownloadComplete 会判未完成，这个分支根本走不到；.aria2 留着给 aria2c
+//     续传（t68），.aria2__temp 没有块映射、不可续传，由 aria2c 路径丢弃重下或成功后的
+//     removeStaleAria2Control 回收（上游 v1.7.9 85fabe1）；
 //   - live 的会话目录 dest.segs/session-*：里面有分段，可能是用户唯一的恢复副本
 //     （live.go 的 staleSessions 只告警不删，这里保持一致——只在根目录空了才收掉它）。
 func cleanupResidue(destPath string) {
@@ -468,10 +506,13 @@ func isAllDigits(s string) bool {
 // 为什么要清：控制文件是「还有东西可以续」的凭证。文件已经被我们完整重写之后它就成了谎言——
 // 留着会让下一次判断永远按「未完成」处理（白重下），也会诱导 aria2c 拿旧偏移去续一个内容
 // 已经换了的文件。aria2c 自己的下载路径不调用它（续传凭证归 aria2c 自己管理）。
+//
+// 要清**两种**：有块映射、可续传的 .aria2，以及 Windows + stdin 模式遗留、没有块映射的
+// .aria2__temp（上游 v1.7.9 85fabe1；留着会让下一次永远按未完成处理）。
 func removeStaleAria2Control(destPath string) {
-	if hasAria2ControlFile(destPath) {
-		if err := os.Remove(aria2ControlPath(destPath)); err == nil {
-			util.LogDebug("已清理遗留的 aria2 控制文件: %s", aria2ControlPath(destPath))
+	for _, control := range []string{aria2ControlPath(destPath), aria2TempControlPath(destPath)} {
+		if err := os.Remove(control); err == nil {
+			util.LogDebug("已清理遗留的 aria2 控制文件: %s", control)
 		}
 	}
 }
@@ -1295,13 +1336,72 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// aria2cGOOS 是「input-file 走 stdin 还是临时文件」这条平台分支的注入点（默认
+// runtime.GOOS）。变量而非常量：Unix 的测试把它改成 "windows" 后用假 aria2c 跑真实的
+// 临时文件路径（windows-latest 上的 shell 脚本用例会跳过），纯函数用例则在所有平台钉住
+// windows/non-windows 的选择——该分支改动的是 Windows 上断点续传能不能工作的行为。
+var aria2cGOOS = runtime.GOOS
+
+// aria2cInputTempDir 存放 Windows 上 input-file 的私有临时文件（"" = os.TempDir()）。
+// 变量而非常量：测试指向 t.TempDir() 以断言临时文件的创建与删除。
+var aria2cInputTempDir string
+
+// aria2cNeedsTempInputFile 报告是否用私有临时文件而非 stdin 传 aria2c 的 input-file。
+// Windows 上 aria2 1.37.0 的 stdin 模式收尾不了控制文件（中断和成功都只留 .aria2__temp
+// 而没有 .aria2，续传失效），上游 v1.7.9 85fabe1 改为临时文件；其它平台保持 stdin——
+// Cookie 不落盘，且与改前逐字一致。
+func aria2cNeedsTempInputFile(goos string) bool { return goos == "windows" }
+
+// aria2cInputFileArg 返回传给 aria2c 的 --input-file 参数值。纯函数（goos 由调用方注入）
+// 以便 windows-latest CI 在没有真实 aria2c 时也能钉住平台选择：windows → 临时文件形态，
+// 其它平台 → "-"（stdin）。
+func aria2cInputFileArg(goos, tempPath string) string {
+	if aria2cNeedsTempInputFile(goos) {
+		return "--input-file=" + tempPath
+	}
+	return "--input-file=-"
+}
+
+// writeAria2cInputTempFile 把 input-file 内容写成仅当前用户可读的临时文件（os.CreateTemp
+// 以 0600 创建；Windows 上位于当前用户 %TEMP%，ACL 继承该目录）。调用方负责在 cmd.Run
+// 返回后删除（含错误/取消路径），见 downloadWithAria2c 的 defer。
+func writeAria2cInputTempFile(content string) (string, error) {
+	f, err := os.CreateTemp(aria2cInputTempDir, "bbdown-aria2-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("创建 aria2c 输入临时文件失败: %w", err)
+	}
+	name := f.Name()
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", fmt.Errorf("写入 aria2c 输入临时文件失败: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", fmt.Errorf("关闭 aria2c 输入临时文件失败: %w", err)
+	}
+	return name, nil
+}
+
 // downloadWithAria2c invokes aria2c with the upstream-compatible argument set,
-// passing URL/headers/cookie/dir/out via stdin (input-file) so credentials do
-// not appear on the command line.
+// passing URL/headers/cookie/dir/out via an input-file so credentials do not
+// appear on the command line: Unix uses stdin (nothing touches disk), Windows
+// uses a private temp file because aria2 1.37.0's stdin mode fails to finalize
+// the control file and breaks resume (upstream v1.7.9 85fabe1).
 func downloadWithAria2c(ctx context.Context, url, destPath string, cfg DownloadConfig) error {
 	bin := "aria2c"
 	if cfg.Aria2cPath != "" {
 		bin = cfg.Aria2cPath
+	}
+	// .aria2__temp 是控制文件的中间态：没有可续传的块映射，预分配出来的等长产物也不可信，
+	// 整组丢弃后完整重下（上游 v1.7.9 85fabe1 的 PrepareAria2cTarget 同款）；清不掉就中止，
+	// 绝不把残件当成品交给混流。只对中间态这样处理：正常的 .aria2 有块映射，留给 aria2c
+	// --continue 续传。
+	if hasAria2TempControlFile(destPath) {
+		util.LogDebug("aria2c: 发现未收尾的控制文件临时文件（%s），丢弃不可信残留后完整重下", aria2TempControlPath(destPath))
+		if err := purgeAria2TempResidue(destPath); err != nil {
+			return err
+		}
 	}
 	args := []string{
 		"--auto-file-renaming=false",
@@ -1320,7 +1420,24 @@ func downloadWithAria2c(ctx context.Context, url, destPath string, cfg DownloadC
 	if cfg.Aria2cArgs != "" {
 		args = append(args, splitArgs(cfg.Aria2cArgs)...)
 	}
-	args = append(args, "--input-file=-")
+
+	inputContent := buildAria2cInputFile(url, needsBilibiliReferer(url), cfg.Cookie, cfg.userAgent(),
+		filepath.Dir(destPath), filepath.Base(destPath))
+	// 输入文件传递方式按平台分流（不是风格选择）：Windows 上 aria2 1.37.0 的
+	// --input-file=- 收尾不了控制文件，中断和成功都只留 .aria2__temp 而没有 .aria2，
+	// 续传失效（上游 v1.7.9 85fabe1）。临时文件仅存活于本次 aria2c 进程期间：失败/取消
+	// 路径也在 defer 里删；进程被强杀时可能残留，但文件名随机且位于当前用户临时目录。
+	useTempInput := aria2cNeedsTempInputFile(aria2cGOOS)
+	inputFile := ""
+	if useTempInput {
+		path, err := writeAria2cInputTempFile(inputContent)
+		if err != nil {
+			return err
+		}
+		inputFile = path
+		defer func() { _ = os.Remove(inputFile) }()
+	}
+	args = append(args, aria2cInputFileArg(aria2cGOOS, inputFile))
 
 	// A hung aria2c would hold a concurrency slot forever. The task context already
 	// carries user cancellation; this adds a hard ceiling on top (upstream 6h).
@@ -1344,15 +1461,16 @@ func downloadWithAria2c(ctx context.Context, url, destPath string, cfg DownloadC
 		cmd.Stderr = pump
 	}
 
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
+	if !useTempInput {
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer stdin.Close()
+			io.WriteString(stdin, inputContent)
+		}()
 	}
-	go func() {
-		defer stdin.Close()
-		io.WriteString(stdin, buildAria2cInputFile(url, needsBilibiliReferer(url), cfg.Cookie, cfg.userAgent(),
-			filepath.Dir(destPath), filepath.Base(destPath)))
-	}()
 
 	// aria2c 只给退出码、自己不核对长度：先探一次服务器声明的长度，跑完复核落盘字节数。
 	// 探测失败（CDN 不支持 HEAD 等）就退化为「只检查文件存在」，不凭空造出误报。
@@ -1366,7 +1484,8 @@ func downloadWithAria2c(ctx context.Context, url, destPath string, cfg DownloadC
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	if _, err := os.Stat(destPath + ".aria2"); err == nil {
+	// .aria2 或 .aria2__temp 任一残留都说明 aria2c 没正常收尾（没有块映射/产物不可信）。
+	if hasAria2ControlFile(destPath) {
 		return fmt.Errorf("aria2下载可能存在错误")
 	}
 	info, err := os.Stat(destPath)

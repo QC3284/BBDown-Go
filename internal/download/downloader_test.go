@@ -101,10 +101,11 @@ func TestExistingDownloadComplete(t *testing.T) {
 	dir := t.TempDir()
 	complete := filepath.Join(dir, "complete.bin")
 	incomplete := filepath.Join(dir, "preallocated.bin")
+	incompleteTemp := filepath.Join(dir, "preallocated-temp.bin")
 	short := filepath.Join(dir, "short.bin")
 	missing := filepath.Join(dir, "missing.bin")
 
-	for path, size := range map[string]int{complete: 10, incomplete: 10, short: 5} {
+	for path, size := range map[string]int{complete: 10, incomplete: 10, incompleteTemp: 10, short: 5} {
 		if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -113,12 +114,19 @@ func TestExistingDownloadComplete(t *testing.T) {
 	if err := os.WriteFile(aria2ControlPath(incomplete), []byte("control"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// 同一种残件的 Windows + stdin 形态：只有控制文件中间态 .aria2__temp（上游 v1.7.9 85fabe1）。
+	if err := os.WriteFile(aria2TempControlPath(incompleteTemp), []byte("temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	if !existingDownloadComplete(complete, 10) {
 		t.Error("大小相等且没有控制文件 → 应当判完整（行为与改前一致）")
 	}
 	if existingDownloadComplete(incomplete, 10) {
 		t.Error("大小相等但存在 aria2 控制文件 → 必须判未完成（t68 的核心）")
+	}
+	if existingDownloadComplete(incompleteTemp, 10) {
+		t.Error("大小相等但存在 .aria2__temp 中间态 → 必须判未完成（上游 v1.7.9 85fabe1）")
 	}
 	if existingDownloadComplete(short, 10) {
 		t.Error("大小不符不该判完整")
@@ -136,6 +144,12 @@ func TestExistingDownloadComplete(t *testing.T) {
 	}
 	if !existingDownloadComplete(incomplete, 10) {
 		t.Error("控制文件清掉之后应当判完整")
+	}
+	if err := os.Remove(aria2TempControlPath(incompleteTemp)); err != nil {
+		t.Fatal(err)
+	}
+	if !existingDownloadComplete(incompleteTemp, 10) {
+		t.Error(".aria2__temp 清掉之后应当判完整")
 	}
 }
 
@@ -190,6 +204,42 @@ func TestDownloadFileRedownloadsPreallocatedWithControlFile(t *testing.T) {
 	}
 	if _, err := os.Stat(aria2ControlPath(dest)); !os.IsNotExist(err) {
 		t.Errorf("成功重写之后应当清掉遗留的 aria2 控制文件（否则下次还会白重下）：%v", err)
+	}
+}
+
+// TestDownloadFileRedownloadsPreallocatedWithTempControlFile 是 t68 的 Windows 形态（上游
+// v1.7.9 85fabe1）:等长产物 + 只有 .aria2__temp 中间态 → 同样必须重下，而不是「大小相等，
+// 跳过」;成功之后两种控制文件都要清掉（否则下次还会白重下）。
+//
+// 变异验证：把 hasAria2ControlFile 退回只看 .aria2 → 本用例红（GET 次数为 0）。
+func TestDownloadFileRedownloadsPreallocatedWithTempControlFile(t *testing.T) {
+	body := []byte("0123456789")
+	srv, hits := newAria2TestServer(t, body)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	// 预分配残件：长度 == 远端总长，内容其实是零；只有控制文件中间态。
+	if err := os.WriteFile(dest, make([]byte, len(body)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aria2TempControlPath(dest), []byte("unfinished"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DownloadConfig{Client: newTestClient(), RetryCount: 1, RetryDelayMs: 1}
+	if err := DownloadFile(context.Background(), srv.URL+"/a.m4s", dest, cfg); err != nil {
+		t.Fatalf("中间态残件应当被重新下载：%v", err)
+	}
+	if atomic.LoadInt32(hits) == 0 {
+		t.Error("大小相等但存在 .aria2__temp 时必须重新下载，实际一次 GET 都没发（被当成完整文件跳过了）")
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("产物应当是本次下载的内容，实际 %q", got)
+	}
+	if _, err := os.Stat(aria2TempControlPath(dest)); !os.IsNotExist(err) {
+		t.Errorf("成功重写之后应当清掉 .aria2__temp（否则下次还会白重下）：%v", err)
 	}
 }
 
