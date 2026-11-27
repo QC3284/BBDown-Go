@@ -169,7 +169,7 @@
 ### 3.1.3 批次（2026-11-08）闭环
 
 - 完成：上游 master 增量跟进六件——config 合并吞 URL 修复（真 bug）、弱 ETag If-Range 回退、续传校验器严格规则 D1（用户批准）+ 清单先读后写修复、订阅隔离副本明确报错、Origin scheme 校验；登记 §4.77。
-- 候选（下一周期）：① X-Forwarded-Proto 信任（对端匹配 --trusted-proxy 时）；② config 文件 `--cookie=值` 等号写法覆盖优先于 CLI 空格写法（F3-2，剥 = 对齐上游 OptionName()）；③ D2 持久化 --per-sub-dir 映射 + 大小写不敏感槽位（→3.2.0）；④ 多线程续传 + 分片布局校验（→3.2.0，含 D3 分片 If-Range）。
+- 候选（下一周期）：① X-Forwarded-Proto 信任（对端匹配 --trusted-proxy 时）；② config 文件 `--cookie=值` 等号写法覆盖优先于 CLI 空格写法（F3-2，剥 = 对齐上游 OptionName()）；③ D2 持久化 --per-sub-dir 映射 + 大小写不敏感槽位（→3.2.0）；④ 多线程续传 + 分片布局校验（→3.2.0，含 D3 分片 If-Range）；⑤ aria2c Windows 续传修复（上游 v1.7.9：Windows 上 --input-file=- 走 stdin 导致只留 .aria2__temp、续传失效 + 预分配等长残件误判完整，需改用私有临时输入文件并识别 .aria2__temp）；⑥ serve /add-task 延迟持久化对齐确认（上游 #115：我方 202 已先于后台持久化返回，疑似已对齐，补钉桩）；⑦ BBDownT 2.2.2 TV 720P 修复复核（我方默认 tv-host 已是 api.snm0516.aisee.tv，疑似已对齐）；⑧ BBDownT 2.2.1「番剧章节未覆盖片尾」评估。
 - TUI 决策（2026-11-13，用户拍板）：**立项优先级最后**——候选清单暂时没有其他可更新项时才启动；设计定稿：自绘终端背景 + 底部 opencode 式选项条（**←→ 移动 + Enter 触发**；A 板 [暂停/恢复][重试][退出]，B 板 [全选][反选][开始下载][取消]），行式输出保留为机器契约（管道/CI/serve 不变）；「暂停/恢复」先映射取消+续传语义，3.2.0 多线程续传落地后升级真暂停；定位 MAJOR（4.0 候选），实现时默认观感变更需用户批准；参考图 docs/cli-concept-tui-v1.png（gitignored）。**2026-11-27 归档：用户明确启用前不再提起。**
 
 
