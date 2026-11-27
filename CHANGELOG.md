@@ -10,6 +10,24 @@
 [docs/UPSTREAM_ALIGNMENT.md](docs/UPSTREAM_ALIGNMENT.md) 的差异表逐条登记，
 候选清单与优先级见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## [3.1.4] - 2026-11-27
+
+**修复批次**（上游 v1.7.9 85fabe1 aria2 续传修复 + 6345e58 serve 受理顺序对齐确认；评估见 2026-11-27 上游增量对照）。
+
+### 变更
+
+- **aria2c Windows 断点续传修复**（对齐上游 85fabe1）：Windows 上 aria2 1.37.0 的 --input-file=-（stdin）模式在进程退出后只留下 `.aria2__temp` 控制文件中间态而没有 `.aria2`——断点续传失效，且预分配出来的等长残件会被误判成完整文件跳过。修复：
+  - 输入文件按平台分流：Windows 用 0600 私有临时文件（成功/失败/取消路径都删除），其它平台保持 stdin 逐字不变（Cookie 不落盘）；
+  - `.aria2__temp` 在全部四处与 `.aria2` 同等对待（存在性判定 / 完整性判定 / 陈旧控制文件清理 / 跑完复核，任一残留即报「aria2下载可能存在错误」）；
+  - 发现 `.aria2__temp` 时整组丢弃不可信产物与两个控制文件后完整重下（清不掉即中止）；正常的 `.aria2` 保留给 aria2c --continue 续传（t68 路径不变，有回归钉住）。
+- **serve /add-task 受理顺序钉桩**（对齐确认 6345e58「fix(serve): defer accepted API task execution」）：我方处理函数本就先登记任务并返回 202、URL 解析/下载/持久化全部后台；本次为 test-only 新用例，持住生产 persistMu 模拟在途落盘，断言 202 先于持久化返回且此刻任务记录尚不存在、放行后确实落盘——防止该顺序将来静默回归。
+
+### 说明
+
+- 差异登记 [§4.78](docs/UPSTREAM_ALIGNMENT.md)。
+- 回归：internal/download/aria2c_resume_test.go（平台选择纯函数用例全平台跑、临时文件生命周期、不可信残留清理、可信控制文件保留、跑完复核、stale 双后缀）+ downloader_test.go 等长+中间态重下用例 + internal/server/add_task_persist_order_test.go；实现 7 项变异、钉桩 2 项变异逐一变红后恢复。
+- 版本位：修复批次 → **patch**（3.1.3 → 3.1.4）。
+
 ## [3.1.3] - 2026-11-08
 
 **修复批次**（上游 master 增量：79e3a91 续传校验器规则 + 70f5423 适用件 + #113/#114 对账收尾；评估见 2026-11-08 上游增量对照）。
