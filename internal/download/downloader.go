@@ -792,8 +792,11 @@ func singleDownload(ctx context.Context, url, destPath string, pr probeResult, c
 			// 小于 1MiB 的辅助资源（封面/字幕等）不显示进度条：它们在百毫秒内完成，
 			// 进度条只会留下一行 100% 噪声。--progress-json 与观察者不看终端、也不看大小——
 			// 它们正是给 GUI/自动化/SSE 消费的，每个文件都该有事件（含收尾帧）。
+			// 尺寸门槛优先看 HEAD 探测；探测失败（pr.size=0）时回退到本次响应自报的
+			// Content-Length——探测失败不等于下载失败，进度条不能跟着一起消失（整页重试
+			// 的续轮里 HEAD 更容易先吃到 412/超时，用户看到的就是「重试时不显示进度条」）。
 			withProgress := resp.ContentLength > 0 &&
-				(progressJSONEnabled.Load() || observer != nil || (isTerminalOut() && pr.size >= 1<<20))
+				(progressJSONEnabled.Load() || observer != nil || (isTerminalOut() && (pr.size >= 1<<20 || resp.ContentLength >= 1<<20)))
 			// 观察者还多覆盖一种情况：响应没声明长度（chunked / 无 Content-Length）。
 			// 终端与 JSON 的既有门槛不变，观察者照收事件、Total 报 0（未知）或由 HEAD
 			// 探测到的整份长度推出本次剩余。

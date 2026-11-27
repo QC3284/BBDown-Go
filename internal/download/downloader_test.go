@@ -243,6 +243,69 @@ func TestDownloadFileRedownloadsPreallocatedWithTempControlFile(t *testing.T) {
 	}
 }
 
+// TestDownloadFileShowsProgressWhenProbeFails 钉住「探测失败 ≠ 下载失败」：HEAD 探测挂掉
+// （pr.size=0）但 GET 正常时，≥1MiB 的下载照样要画终端进度条——进度条的门槛不许跟着探测
+// 一起消失（整页重试的续轮里 HEAD 更容易先吃到 412/超时，用户看到的就是「重试时不显示
+// 进度条」）。尺寸门槛回退到本次响应自报的 Content-Length，1MiB 以下仍按既有口径抑制。
+//
+// 变异验证：把门槛退回只看 pr.size → 本用例红（一帧都不画）。
+func TestDownloadFileShowsProgressWhenProbeFails(t *testing.T) {
+	body := make([]byte, 2<<20)
+	for i := range body {
+		body[i] = byte(i)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	withFakeTerminal(t)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	out := captureStdout(t, func() {
+		cfg := DownloadConfig{Client: newTestClient(), RetryCount: 1, RetryDelayMs: 1}
+		if err := DownloadFile(context.Background(), srv.URL+"/a.bin", dest, cfg); err != nil {
+			t.Errorf("探测失败不应影响下载: %v", err)
+		}
+	})
+	if !bytes.Contains([]byte(out), []byte("\r")) {
+		t.Error("HEAD 探测失败但 GET 正常时，≥1MiB 下载应当照画进度条，实际一帧都没有")
+	}
+}
+
+// TestDownloadFileStillSuppressesBarForSmallFileWhenProbeFails 钉住门槛的另一半：探测失败
+// 时 1MiB 以下的小文件仍按既有口径抑制进度条（辅助资源只留一行 100% 噪声的问题不复发）。
+func TestDownloadFileStillSuppressesBarForSmallFileWhenProbeFails(t *testing.T) {
+	body := make([]byte, 64<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	withFakeTerminal(t)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	out := captureStdout(t, func() {
+		cfg := DownloadConfig{Client: newTestClient(), RetryCount: 1, RetryDelayMs: 1}
+		if err := DownloadFile(context.Background(), srv.URL+"/a.bin", dest, cfg); err != nil {
+			t.Errorf("探测失败不应影响下载: %v", err)
+		}
+	})
+	if bytes.Contains([]byte(out), []byte("\r")) {
+		t.Errorf("探测失败 + 小文件仍应抑制进度条，实际画了帧: %q", out)
+	}
+}
+
 // TestDownloadFileSkipsCompleteWithoutControlFile 钉住「真完整照旧跳过」（t68 ③）：
 // 没有控制文件、大小相等 → 不发 GET、直接返回。
 func TestDownloadFileSkipsCompleteWithoutControlFile(t *testing.T) {
