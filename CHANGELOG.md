@@ -10,6 +10,18 @@
 [docs/UPSTREAM_ALIGNMENT.md](docs/UPSTREAM_ALIGNMENT.md) 的差异表逐条登记，
 候选清单与优先级见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## [3.1.5] - 2026-11-28
+
+**修复批次**（重试时不显示进度条；无新上游增量）。
+
+### 变更
+
+- **HEAD 探测失败时进度条消失修复**：终端进度条的尺寸门槛此前只看 HEAD 探测结果（`pr.size >= 1MiB`）——探测失败时 `pr.size=0`，下载明明在进行（GET 正常），进度条却一帧都不画。整页自动重试的续轮里 HEAD 更容易先吃到 412/超时，所以现象是「重试时不显示进度条」。修复：门槛在探测失败时回退到本次响应自报的 Content-Length（探测失败 ≠ 下载失败，进度反馈不该跟着探测一起消失）；1MiB 以下辅助资源的抑制口径不变，小文件不会重新刷屏。
+
+### 说明
+
+- 回归：internal/download/downloader_test.go 新增 TestDownloadFileShowsProgressWhenProbeFails（HEAD 500 + GET 2MiB，强制终端捕获帧）+ TestDownloadFileStillSuppressesBarForSmallFileWhenProbeFails（探测失败时小文件仍抑制）；变异验证：门槛退回只看 pr.size → 前一用例红（一帧都没有）。
+- 版本位：修复批次 → **patch**（3.1.4 → 3.1.5）。
 ## [3.1.4] - 2026-11-27
 
 **修复批次**（上游 v1.7.9 85fabe1 aria2 续传修复 + 6345e58 serve 受理顺序对齐确认；评估见 2026-11-27 上游增量对照）。
